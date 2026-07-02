@@ -19,5 +19,5 @@ pub use request::{
     CachePolicy, MessagePart, MessageRole, ModelMessage, ModelRequest, PrivacyPolicy,
 };
 pub use response::ModelResponse;
-pub use routing::RoutingDecision;
+pub use routing::{ModelRoute, RoutingDecision};
 pub use usage::NormalizedUsage;

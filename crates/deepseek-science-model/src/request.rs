@@ -51,29 +51,35 @@ impl ModelMessage {
 
 /// Prompt-cache preferences for a model request.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CachePolicy {
-    /// Stable prefix hash computed by the prompt compiler.
-    pub stable_prefix_hash: Option<String>,
-    /// Whether a provider-side cache may be used when available.
-    pub allow_provider_cache: bool,
+pub enum CachePolicy {
+    /// Let the provider adapter use its normal cache behavior.
+    #[default]
+    UseProviderDefault,
+    /// Prefer provider-side prompt caching when available.
+    PreferCache {
+        /// Stable prefix hash computed by the prompt compiler, when available.
+        stable_prefix_hash: Option<String>,
+    },
+    /// Do not use provider-side prompt caching for this request.
+    BypassCache,
 }
 
 /// Privacy policy applied before routing a request to a provider.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PrivacyPolicy {
-    /// Whether the request may leave the local runtime.
-    pub allow_external_provider: bool,
-    /// Whether provider log retention is acceptable for this request.
-    pub allow_provider_retention: bool,
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PrivacyPolicy {
+    /// Standard provider routing is allowed.
+    #[default]
+    Standard,
+    /// The request must not use external network providers.
+    NoExternalNetwork,
+    /// The request must stay within local-only model routes.
+    LocalOnly,
 }
 
 impl PrivacyPolicy {
     /// Creates a local-only policy for sensitive or unapproved requests.
     pub fn local_only() -> Self {
-        Self {
-            allow_external_provider: false,
-            allow_provider_retention: false,
-        }
+        Self::LocalOnly
     }
 }
 
@@ -99,5 +105,34 @@ impl ModelRequest {
             cache_policy: CachePolicy::default(),
             privacy_policy: PrivacyPolicy::local_only(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachePolicy, PrivacyPolicy};
+
+    #[test]
+    fn cache_policy_values_can_be_constructed() {
+        assert_eq!(CachePolicy::UseProviderDefault, CachePolicy::default());
+        assert_eq!(
+            CachePolicy::PreferCache {
+                stable_prefix_hash: Some("prefix".to_owned())
+            },
+            CachePolicy::PreferCache {
+                stable_prefix_hash: Some("prefix".to_owned())
+            }
+        );
+        assert_eq!(CachePolicy::BypassCache, CachePolicy::BypassCache);
+    }
+
+    #[test]
+    fn privacy_policy_values_can_be_constructed() {
+        assert_eq!(PrivacyPolicy::Standard, PrivacyPolicy::Standard);
+        assert_eq!(
+            PrivacyPolicy::NoExternalNetwork,
+            PrivacyPolicy::NoExternalNetwork
+        );
+        assert_eq!(PrivacyPolicy::LocalOnly, PrivacyPolicy::local_only());
     }
 }
