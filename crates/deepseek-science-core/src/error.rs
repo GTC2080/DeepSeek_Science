@@ -1,6 +1,6 @@
 //! Error types for the domain-neutral kernel.
 
-use crate::{EventSequence, RunId, RunState};
+use crate::{workflow::WorkflowStepKey, EventSequence, RunId, RunState};
 use thiserror::Error;
 
 /// Errors raised by core entity constructors and state transitions.
@@ -11,6 +11,33 @@ pub enum CoreError {
     EmptyField {
         /// Name of the rejected field.
         field: &'static str,
+    },
+
+    /// A workflow plan identifier was empty after whitespace trimming.
+    #[error("workflow id must not be empty")]
+    EmptyWorkflowId,
+
+    /// A workflow plan name was empty after whitespace trimming.
+    #[error("workflow name must not be empty")]
+    EmptyWorkflowName,
+
+    /// A workflow step key was empty after whitespace trimming.
+    #[error("workflow step key must not be empty")]
+    EmptyWorkflowStepKey,
+
+    /// A workflow step label was empty after whitespace trimming.
+    #[error("workflow step label must not be empty")]
+    EmptyWorkflowStepLabel,
+
+    /// A workflow plan did not contain any steps.
+    #[error("workflow plan must contain at least one step")]
+    EmptyWorkflowPlan,
+
+    /// A workflow plan reused a step key.
+    #[error("duplicate workflow step key: {step_key}")]
+    DuplicateWorkflowStep {
+        /// Duplicated caller-provided step key.
+        step_key: WorkflowStepKey,
     },
 
     /// A run was asked to move through a transition the kernel does not allow.
