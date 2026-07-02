@@ -8,6 +8,7 @@
 pub mod error;
 pub mod events;
 pub mod ids;
+pub mod inspection;
 pub mod project;
 pub mod run;
 pub mod thread;
@@ -15,6 +16,7 @@ pub mod thread;
 pub use error::CoreError;
 pub use events::{CoreEvent, CoreEventEnvelope, EventSequence};
 pub use ids::{ArtifactId, ProjectId, RunId, StepId, ThreadId};
+pub use inspection::RunInspection;
 pub use project::Project;
 pub use run::{AgentRun, RunState, RunStep};
 pub use thread::Thread;
