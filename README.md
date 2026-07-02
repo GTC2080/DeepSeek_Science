@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/DeepSeek_Science.svg?v=20260702-2" alt="DeepSeek Science logo" width="260">
+  <img src="docs/assets/DeepSeek_Science.svg?v=20260702-3" alt="DeepSeek Science logo" width="260">
 </p>
 
 <h1 align="center">DeepSeek_Science</h1>
