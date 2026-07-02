@@ -1,12 +1,38 @@
+# Rust build output
 /target/
 /.cache/
+
+# Project-generated output
 /tmp/
-/runs/tmp/
-/artifacts/tmp/
+/runs/
+/artifacts/
 /test-output/
+
+# Logs, coverage, and profiling output
+/logs/
+*.log
+/coverage/
+lcov.info
+*.lcov
+tarpaulin-report.html
 *.profraw
 *.profdata
+/criterion/
+perf.data
+perf.data.old
+flamegraph.svg
+
+# OS, editor, and local-only agent files
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+AGENTS.md
+
+# Local environment and secrets
 .env
 .env.*
 !.env.example
+.direnv/
