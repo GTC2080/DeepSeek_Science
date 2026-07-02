@@ -21,16 +21,37 @@ impl DeepSeekModel {
         }
     }
 
+    /// Returns a display name for diagnostics and future UI shells.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Chat => "DeepSeek Chat",
+            Self::Reasoner => "DeepSeek Reasoner",
+        }
+    }
+
     /// Returns a provider-neutral descriptor.
     pub fn descriptor(self) -> ModelDescriptor {
-        ModelDescriptor::new(
-            "deepseek",
-            self.model_id(),
-            ModelCapabilities {
-                modalities: vec![deepseek_science_model::Modality::Text],
-                supports_prompt_cache: true,
-                max_context_tokens: None,
-            },
-        )
+        let mut capabilities = ModelCapabilities::text_only(None);
+        capabilities.supports_prompt_cache = true;
+
+        ModelDescriptor::new("deepseek", self.model_id(), capabilities)
+            .with_display_name(self.display_name())
+            .with_notes("Phase 1 placeholder descriptor; no network client or API key handling.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeepSeekModel;
+
+    #[test]
+    fn placeholder_descriptor_can_be_constructed() {
+        let descriptor = DeepSeekModel::Reasoner.descriptor();
+
+        assert_eq!(descriptor.provider, "deepseek");
+        assert_eq!(descriptor.model, "deepseek-reasoner");
+        assert_eq!(descriptor.display_name, "DeepSeek Reasoner");
+        assert!(descriptor.capabilities.supports_prompt_cache);
+        assert!(descriptor.notes.is_some());
     }
 }

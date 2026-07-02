@@ -50,6 +50,26 @@ impl NormalizedUsage {
 
         self.cache_hit_tokens as f64 / cache_accounted as f64
     }
+
+    /// Returns the cache miss rate across cache-accounted input tokens.
+    pub fn cache_miss_rate(&self) -> f64 {
+        let cache_accounted = self.cache_hit_tokens + self.cache_miss_tokens;
+        if cache_accounted == 0 {
+            return 0.0;
+        }
+
+        self.cache_miss_tokens as f64 / cache_accounted as f64
+    }
+
+    /// Returns the expected total from input and output tokens.
+    pub fn expected_total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    /// Returns whether reported total tokens match input plus output tokens.
+    pub fn total_tokens_are_consistent(&self) -> bool {
+        self.total_tokens == self.expected_total_tokens()
+    }
 }
 
 #[cfg(test)]
@@ -62,5 +82,15 @@ mod tests {
 
         assert_eq!(usage.total_tokens, 120);
         assert!((usage.cache_hit_rate() - 0.75).abs() < f64::EPSILON);
+        assert!((usage.cache_miss_rate() - 0.25).abs() < f64::EPSILON);
+        assert!(usage.total_tokens_are_consistent());
+    }
+
+    #[test]
+    fn usage_cache_hit_rate_handles_zero_input_tokens() {
+        let usage = NormalizedUsage::new(0, 0, 0, 0, 0.0);
+
+        assert_eq!(usage.cache_hit_rate(), 0.0);
+        assert_eq!(usage.cache_miss_rate(), 0.0);
     }
 }
