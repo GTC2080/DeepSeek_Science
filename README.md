@@ -2,11 +2,13 @@
   <img src="docs/assets/DeepSeek_Science.svg?v=20260702-4" alt="DeepSeek Science logo" width="220">
 </p>
 
-# DeepSeek_Science
+<h1 align="center">DeepSeek_Science</h1>
 
-A Rust-first Science Agent Kernel for reproducible, auditable, and low-cost STEM workflows.
+<p align="center">
+  <strong>A Rust-first Science Agent Kernel for reproducible, auditable, and low-cost STEM workflows.</strong>
+</p>
 
-<p>
+<p align="center">
   <img alt="Rust only" src="https://img.shields.io/badge/Rust-only-dea584">
   <img alt="Phase 1 kernel" src="https://img.shields.io/badge/Phase%201-kernel-blue">
   <img alt="Headless first" src="https://img.shields.io/badge/headless-first-4d6bfe">
