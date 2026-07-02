@@ -1,6 +1,6 @@
 //! Agent run and step state for replayable kernel execution.
 
-use crate::{CoreError, RunId, StepId, ThreadId};
+use crate::{CoreError, CoreEvent, RunId, StepId, ThreadId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -137,6 +137,13 @@ impl AgentRun {
 
         self.state = next;
         Ok(())
+    }
+
+    /// Moves the run to a valid state and returns the matching transition event.
+    pub fn transition_to_with_event(&mut self, next: RunState) -> Result<CoreEvent, CoreError> {
+        let from = self.state;
+        self.transition_to(next)?;
+        Ok(CoreEvent::run_state_changed(self.id, from, next))
     }
 
     /// Appends a step to the run in replay order.
@@ -288,5 +295,58 @@ mod tests {
             })
         );
         assert_eq!(run.state(), RunState::Created);
+    }
+
+    #[test]
+    fn valid_transition_can_produce_state_change_event() {
+        let mut run = AgentRun::new(ThreadId::new());
+        let run_id = run.id();
+
+        let result = run.transition_to_with_event(RunState::Planning);
+
+        assert_eq!(run.state(), RunState::Planning);
+        assert_eq!(
+            result,
+            Ok(crate::CoreEvent::RunStateChanged {
+                run_id,
+                from: RunState::Created,
+                to: RunState::Planning,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_transition_does_not_create_event_or_mutate_state() {
+        let mut run = AgentRun::new(ThreadId::new());
+
+        let result = run.transition_to_with_event(RunState::RunningTool);
+
+        assert_eq!(
+            result,
+            Err(CoreError::InvalidRunTransition {
+                from: RunState::Created,
+                to: RunState::RunningTool,
+            })
+        );
+        assert_eq!(run.state(), RunState::Created);
+    }
+
+    #[test]
+    fn terminal_state_transition_attempt_does_not_create_event() {
+        let mut run = AgentRun::new(ThreadId::new());
+        let completed = run.transition_to_with_event(RunState::Canceled);
+
+        assert!(completed.is_ok());
+
+        let result = run.transition_to_with_event(RunState::Planning);
+
+        assert_eq!(
+            result,
+            Err(CoreError::InvalidRunTransition {
+                from: RunState::Canceled,
+                to: RunState::Planning,
+            })
+        );
+        assert_eq!(run.state(), RunState::Canceled);
     }
 }

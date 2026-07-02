@@ -13,7 +13,7 @@ pub mod run;
 pub mod thread;
 
 pub use error::CoreError;
-pub use events::CoreEvent;
+pub use events::{CoreEvent, CoreEventEnvelope, EventSequence};
 pub use ids::{ArtifactId, ProjectId, RunId, StepId, ThreadId};
 pub use project::Project;
 pub use run::{AgentRun, RunState, RunStep};
