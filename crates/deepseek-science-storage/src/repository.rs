@@ -33,3 +33,19 @@ pub trait ArtifactRepository {
         artifact_id: ArtifactId,
     ) -> Result<Option<ArtifactManifest>, StorageError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ArtifactRepository, ProjectRepository, RunRepository};
+
+    #[test]
+    fn repository_traits_remain_object_safe_contracts() {
+        let project_repo: Option<&dyn ProjectRepository> = None;
+        let run_repo: Option<&dyn RunRepository> = None;
+        let artifact_repo: Option<&dyn ArtifactRepository> = None;
+
+        assert!(project_repo.is_none());
+        assert!(run_repo.is_none());
+        assert!(artifact_repo.is_none());
+    }
+}
