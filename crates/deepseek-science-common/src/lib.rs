@@ -13,5 +13,5 @@ pub mod units;
 pub use error::CommonError;
 pub use fitting::{simple_linear_regression, LinearRegression};
 pub use statistics::mean;
-pub use table::TableShape;
+pub use table::{ColumnName, DataColumn, DataTable, TableShape};
 pub use units::Unit;
