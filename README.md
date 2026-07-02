@@ -135,3 +135,7 @@ generation, and provenance. It must remain outside the domain-neutral core.
 The long-term goal is STEM-wide extensibility across chemistry, physics,
 materials science, engineering, mathematics, bioinformatics, and related
 scientific domains.
+
+## License
+
+DeepSeek_Science is licensed under the [MIT License](LICENSE).
