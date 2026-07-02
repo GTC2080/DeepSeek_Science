@@ -12,7 +12,7 @@ pub mod registry;
 pub mod result;
 
 pub use call::ToolCall;
-pub use definition::ToolDefinition;
+pub use definition::{ToolDefinition, ToolId};
 pub use error::ToolError;
 pub use permissions::{RiskLevel, ToolPermission};
 pub use registry::ToolRegistry;

@@ -25,6 +25,8 @@ pub struct ToolResult {
     pub status: ToolStatus,
     /// JSON output when the call succeeds.
     pub output: Option<Value>,
+    /// Logical artifact references produced by the call handler.
+    pub artifact_refs: Vec<String>,
     /// Human-readable error when the call fails or is denied.
     pub error: Option<String>,
 }
@@ -36,7 +38,24 @@ impl ToolResult {
             call_id: call_id.into(),
             status: ToolStatus::Succeeded,
             output: Some(output),
+            artifact_refs: Vec::new(),
             error: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolResult, ToolStatus};
+    use serde_json::json;
+
+    #[test]
+    fn successful_result_keeps_call_id_output_and_empty_artifacts() {
+        let result = ToolResult::succeeded("call-1", json!({"answer": 42}));
+
+        assert_eq!(result.call_id, "call-1");
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert_eq!(result.output, Some(json!({"answer": 42})));
+        assert!(result.artifact_refs.is_empty());
     }
 }
