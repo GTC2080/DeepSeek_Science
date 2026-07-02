@@ -26,6 +26,14 @@ pub enum PathSafetyViolation {
     CurrentDir,
 }
 
+/// Reason an atomic write request cannot be planned.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum WriteRequestViolation {
+    /// The validated target path does not end in a file name.
+    #[error("target path must include a file name")]
+    MissingTargetFileName,
+}
+
 /// Errors surfaced by future storage implementations.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum StorageError {
@@ -42,6 +50,48 @@ pub enum StorageError {
         path: PathBuf,
         /// Specific safety violation.
         reason: PathSafetyViolation,
+    },
+    /// An atomic write request is invalid before filesystem access occurs.
+    #[error("invalid write request: {reason}")]
+    InvalidWriteRequest {
+        /// Specific request validation failure.
+        reason: WriteRequestViolation,
+    },
+    /// A future write target's parent directory does not exist.
+    #[error("parent directory is missing for {path:?}")]
+    ParentDirectoryMissing {
+        /// Final target path whose parent is missing.
+        path: PathBuf,
+    },
+    /// Create-new mode found an existing target.
+    #[error("target already exists: {path:?}")]
+    TargetAlreadyExists {
+        /// Existing final target path.
+        path: PathBuf,
+    },
+    /// Replace-existing mode did not find an existing target.
+    #[error("target is missing: {path:?}")]
+    TargetMissing {
+        /// Missing final target path.
+        path: PathBuf,
+    },
+    /// Writing the temporary sibling failed.
+    #[error("write failed for {path:?}: {reason}")]
+    WriteFailed {
+        /// Temporary path that could not be written.
+        path: PathBuf,
+        /// Failure reason with sensitive data already removed.
+        reason: String,
+    },
+    /// Renaming a temporary sibling into the final target failed.
+    #[error("rename failed from {from:?} to {to:?}: {reason}")]
+    RenameFailed {
+        /// Temporary path that was written first.
+        from: PathBuf,
+        /// Final target path.
+        to: PathBuf,
+        /// Failure reason with sensitive data already removed.
+        reason: String,
     },
     /// A storage backend failed with a human-readable reason.
     #[error("storage backend failed: {reason}")]
