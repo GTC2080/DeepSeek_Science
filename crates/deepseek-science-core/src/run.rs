@@ -6,19 +6,23 @@ use std::fmt;
 
 /// Lifecycle state for an agent run or run step.
 ///
-/// The state machine is deliberately small in Phase 1. It is enough to model
-/// planning, execution, approvals, and terminal states without embedding domain
-/// workflow details in the core crate.
+/// The state machine is deliberately small and explicit. It models planning,
+/// approvals, model work, tool work, review, and terminal states without
+/// embedding domain workflow details in the core crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RunState {
     /// The run has been created but no plan has been produced.
     Created,
     /// The agent is preparing a plan or prompt context.
     Planning,
-    /// The agent is actively executing model or tool work.
-    Running,
     /// The run is paused until a user approves a risky action.
     WaitingForApproval,
+    /// The run is waiting for a model response.
+    RunningModel,
+    /// The run is waiting for a tool result.
+    RunningTool,
+    /// The run is passing through a review or validation stage.
+    Reviewing,
     /// The run finished successfully.
     Completed,
     /// The run failed with a recorded error.
@@ -33,17 +37,35 @@ impl RunState {
         matches!(
             (self, next),
             (Self::Created, Self::Planning)
-                | (Self::Planning, Self::Running)
-                | (Self::Running, Self::WaitingForApproval)
-                | (Self::WaitingForApproval, Self::Running)
-                | (Self::Running, Self::Completed)
-                | (Self::Running, Self::Failed)
-                | (Self::Planning, Self::Failed)
                 | (Self::Created, Self::Canceled)
+                | (Self::Planning, Self::WaitingForApproval)
+                | (Self::Planning, Self::RunningModel)
+                | (Self::Planning, Self::RunningTool)
+                | (Self::Planning, Self::Failed)
                 | (Self::Planning, Self::Canceled)
-                | (Self::Running, Self::Canceled)
+                | (Self::WaitingForApproval, Self::RunningModel)
+                | (Self::WaitingForApproval, Self::RunningTool)
+                | (Self::WaitingForApproval, Self::Failed)
                 | (Self::WaitingForApproval, Self::Canceled)
+                | (Self::RunningModel, Self::RunningTool)
+                | (Self::RunningModel, Self::Reviewing)
+                | (Self::RunningModel, Self::Completed)
+                | (Self::RunningModel, Self::Failed)
+                | (Self::RunningModel, Self::Canceled)
+                | (Self::RunningTool, Self::RunningModel)
+                | (Self::RunningTool, Self::Reviewing)
+                | (Self::RunningTool, Self::Completed)
+                | (Self::RunningTool, Self::Failed)
+                | (Self::RunningTool, Self::Canceled)
+                | (Self::Reviewing, Self::Completed)
+                | (Self::Reviewing, Self::Failed)
+                | (Self::Reviewing, Self::Canceled)
         )
+    }
+
+    /// Returns true when the state closes the run lifecycle.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Canceled)
     }
 }
 
@@ -52,8 +74,10 @@ impl fmt::Display for RunState {
         let label = match self {
             Self::Created => "created",
             Self::Planning => "planning",
-            Self::Running => "running",
             Self::WaitingForApproval => "waiting_for_approval",
+            Self::RunningModel => "running_model",
+            Self::RunningTool => "running_tool",
+            Self::Reviewing => "reviewing",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
@@ -165,15 +189,104 @@ impl RunStep {
 #[cfg(test)]
 mod tests {
     use super::{AgentRun, RunState};
-    use crate::ThreadId;
+    use crate::{CoreError, ThreadId};
+
+    fn all_states() -> [RunState; 9] {
+        [
+            RunState::Created,
+            RunState::Planning,
+            RunState::WaitingForApproval,
+            RunState::RunningModel,
+            RunState::RunningTool,
+            RunState::Reviewing,
+            RunState::Completed,
+            RunState::Failed,
+            RunState::Canceled,
+        ]
+    }
 
     #[test]
-    fn run_state_can_transition_from_created_to_planning() {
+    fn created_can_transition_to_planning() {
+        assert!(RunState::Created.can_transition_to(RunState::Planning));
+    }
+
+    #[test]
+    fn created_can_transition_to_canceled() {
+        assert!(RunState::Created.can_transition_to(RunState::Canceled));
+    }
+
+    #[test]
+    fn planning_can_transition_to_running_model() {
+        assert!(RunState::Planning.can_transition_to(RunState::RunningModel));
+    }
+
+    #[test]
+    fn running_model_can_transition_to_running_tool() {
+        assert!(RunState::RunningModel.can_transition_to(RunState::RunningTool));
+    }
+
+    #[test]
+    fn reviewing_can_transition_to_completed() {
+        assert!(RunState::Reviewing.can_transition_to(RunState::Completed));
+    }
+
+    #[test]
+    fn completed_cannot_transition_to_any_other_state() {
+        for state in all_states() {
+            assert!(!RunState::Completed.can_transition_to(state));
+        }
+    }
+
+    #[test]
+    fn failed_cannot_transition_to_any_other_state() {
+        for state in all_states() {
+            assert!(!RunState::Failed.can_transition_to(state));
+        }
+    }
+
+    #[test]
+    fn canceled_cannot_transition_to_any_other_state() {
+        for state in all_states() {
+            assert!(!RunState::Canceled.can_transition_to(state));
+        }
+    }
+
+    #[test]
+    fn terminal_state_helper_marks_only_terminal_states() {
+        for state in all_states() {
+            assert_eq!(
+                state.is_terminal(),
+                matches!(
+                    state,
+                    RunState::Completed | RunState::Failed | RunState::Canceled
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn transition_to_updates_state_on_valid_transition() {
         let mut run = AgentRun::new(ThreadId::new());
 
         let result = run.transition_to(RunState::Planning);
 
         assert!(result.is_ok());
         assert_eq!(run.state(), RunState::Planning);
+    }
+
+    #[test]
+    fn transition_to_preserves_state_on_invalid_transition() {
+        let mut run = AgentRun::new(ThreadId::new());
+
+        let result = run.transition_to(RunState::RunningTool);
+
+        assert_eq!(
+            result,
+            Err(CoreError::InvalidRunTransition {
+                from: RunState::Created,
+                to: RunState::RunningTool,
+            })
+        );
+        assert_eq!(run.state(), RunState::Created);
     }
 }
