@@ -9,6 +9,10 @@ pub enum CommonError {
     #[error("input slice must not be empty")]
     EmptyInput,
 
+    /// A calculation received NaN or infinity.
+    #[error("input values must be finite")]
+    NonFiniteValue,
+
     /// Related slices did not have the same length.
     #[error("input slices must have the same length")]
     LengthMismatch,

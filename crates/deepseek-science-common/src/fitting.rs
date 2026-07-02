@@ -14,7 +14,7 @@ pub struct LinearRegression {
     pub r_squared: f64,
 }
 
-/// Fits `y = slope * x + intercept` over paired slices.
+/// Fits `y = slope * x + intercept` over paired finite slices.
 pub fn simple_linear_regression(
     x_values: &[f64],
     y_values: &[f64],
@@ -67,6 +67,8 @@ pub fn simple_linear_regression(
 
 #[cfg(test)]
 mod tests {
+    use crate::CommonError;
+
     use super::simple_linear_regression;
 
     #[test]
@@ -81,5 +83,45 @@ mod tests {
             }
             Err(error) => panic!("linear regression should fit simple data: {error}"),
         }
+    }
+
+    #[test]
+    fn linear_regression_returns_deterministic_r_squared_for_perfect_data() {
+        let result = simple_linear_regression(&[-1.0, 0.0, 1.0, 2.0], &[-1.0, 1.0, 3.0, 5.0]);
+
+        match result {
+            Ok(fit) => assert_eq!(fit.r_squared, 1.0),
+            Err(error) => panic!("linear regression should fit simple data: {error}"),
+        }
+    }
+
+    #[test]
+    fn linear_regression_rejects_mismatched_input_lengths() {
+        let result = simple_linear_regression(&[1.0, 2.0], &[1.0]);
+
+        assert_eq!(result, Err(CommonError::LengthMismatch));
+    }
+
+    #[test]
+    fn linear_regression_rejects_fewer_than_two_points() {
+        let result = simple_linear_regression(&[1.0], &[2.0]);
+
+        assert_eq!(result, Err(CommonError::TooFewObservations));
+    }
+
+    #[test]
+    fn linear_regression_rejects_non_finite_values() {
+        let nan_result = simple_linear_regression(&[1.0, f64::NAN], &[2.0, 3.0]);
+        let infinity_result = simple_linear_regression(&[1.0, 2.0], &[2.0, f64::INFINITY]);
+
+        assert_eq!(nan_result, Err(CommonError::NonFiniteValue));
+        assert_eq!(infinity_result, Err(CommonError::NonFiniteValue));
+    }
+
+    #[test]
+    fn linear_regression_rejects_zero_x_variance() {
+        let result = simple_linear_regression(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]);
+
+        assert_eq!(result, Err(CommonError::ZeroVariance));
     }
 }
