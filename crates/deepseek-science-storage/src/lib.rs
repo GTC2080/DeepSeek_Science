@@ -8,6 +8,6 @@ pub mod error;
 pub mod layout;
 pub mod repository;
 
-pub use error::StorageError;
-pub use layout::StorageLayout;
+pub use error::{PathSafetyViolation, StorageError};
+pub use layout::{ProjectLayout, StorageLayout, StorageRoot};
 pub use repository::{ArtifactRepository, ProjectRepository, RunRepository};
