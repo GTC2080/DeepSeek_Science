@@ -1,0 +1,5 @@
+id = "chemistry.kinetics_csv"
+version = "0.1.0"
+name = "Kinetics CSV"
+status = "placeholder"
+description = "Future workflow placeholder for small kinetics CSV analysis."

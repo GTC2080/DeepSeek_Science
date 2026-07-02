@@ -1,0 +1,12 @@
+[build]
+target-dir = "../.cache/deepseek-science-target"
+
+[alias]
+ccore = "check -p deepseek-science-core"
+cmodel = "check -p deepseek-science-model"
+cprompt = "check -p deepseek-science-prompt"
+ctools = "check -p deepseek-science-tools"
+tcore = "test -p deepseek-science-core --lib"
+tmodel = "test -p deepseek-science-model --lib"
+tprompt = "test -p deepseek-science-prompt --lib"
+ttools = "test -p deepseek-science-tools --lib"

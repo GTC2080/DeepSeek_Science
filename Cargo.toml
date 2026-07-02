@@ -1,0 +1,43 @@
+[workspace]
+members = [
+    "crates/deepseek-science-core",
+    "crates/deepseek-science-model",
+    "crates/deepseek-science-model-deepseek",
+    "crates/deepseek-science-prompt",
+    "crates/deepseek-science-tools",
+    "crates/deepseek-science-common",
+    "crates/deepseek-science-artifacts",
+    "crates/deepseek-science-storage",
+    "crates/deepseek-science-sandbox",
+    "crates/deepseek-science-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+blake3 = "1.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+uuid = { version = "1.8", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"

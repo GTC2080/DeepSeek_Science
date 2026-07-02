@@ -1,0 +1,12 @@
+/target/
+/.cache/
+/tmp/
+/runs/tmp/
+/artifacts/tmp/
+/test-output/
+*.profraw
+*.profdata
+.DS_Store
+.env
+.env.*
+!.env.example

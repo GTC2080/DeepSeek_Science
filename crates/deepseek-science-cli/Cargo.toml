@@ -1,0 +1,24 @@
+[package]
+name = "deepseek-science-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "deepseek-science"
+path = "src/main.rs"
+
+[dependencies]
+deepseek-science-artifacts = { path = "../deepseek-science-artifacts" }
+deepseek-science-common = { path = "../deepseek-science-common" }
+deepseek-science-core = { path = "../deepseek-science-core" }
+deepseek-science-model = { path = "../deepseek-science-model" }
+deepseek-science-model-deepseek = { path = "../deepseek-science-model-deepseek" }
+deepseek-science-prompt = { path = "../deepseek-science-prompt" }
+deepseek-science-sandbox = { path = "../deepseek-science-sandbox" }
+deepseek-science-storage = { path = "../deepseek-science-storage" }
+deepseek-science-tools = { path = "../deepseek-science-tools" }
+
+[lints]
+workspace = true

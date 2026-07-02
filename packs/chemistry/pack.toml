@@ -1,0 +1,4 @@
+id = "chemistry"
+version = "0.1.0"
+name = "Chemistry"
+enabled_workflows = ["chemistry.kinetics_csv"]
