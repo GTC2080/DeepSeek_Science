@@ -9,5 +9,5 @@ pub mod policy;
 pub mod runner;
 
 pub use error::SandboxError;
-pub use policy::{ExecutionPermission, SandboxPolicy};
+pub use policy::{ApprovalRequirement, ExecutionPermission, SandboxDecision, SandboxPolicy};
 pub use runner::{SandboxRequest, SandboxResult, SandboxRunner};
