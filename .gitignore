@@ -30,6 +30,9 @@ Thumbs.db
 *.swp
 *.swo
 AGENTS.md
+DEVELOPMENT.md
+KERNEL_RFC.md
+ROADMAP.md
 
 # Local environment and secrets
 .env

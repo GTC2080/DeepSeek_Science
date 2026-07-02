@@ -35,5 +35,4 @@ cargo test --workspace --lib
 cargo run -p deepseek-science-cli -- doctor
 ```
 
-For crate-specific checks, see `.cargo/config.toml` aliases and
-`DEVELOPMENT.md`.
+For crate-specific checks, see `.cargo/config.toml` aliases.
