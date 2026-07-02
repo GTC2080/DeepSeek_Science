@@ -10,11 +10,19 @@ mod tests {
     use super::hash_bytes;
 
     #[test]
-    fn hash_stable() {
+    fn same_bytes_produce_same_hash() {
         let first = hash_bytes(b"artifact");
         let second = hash_bytes(b"artifact");
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn different_bytes_produce_different_hashes() {
+        let first = hash_bytes(b"artifact-a");
+        let second = hash_bytes(b"artifact-b");
+
+        assert_ne!(first, second);
     }
 }
