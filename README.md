@@ -136,6 +136,11 @@ The long-term goal is STEM-wide extensibility across chemistry, physics,
 materials science, engineering, mathematics, bioinformatics, and related
 scientific domains.
 
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening issues or pull
+requests.
+
 ## License
 
 DeepSeek_Science is licensed under the [MIT License](LICENSE).
