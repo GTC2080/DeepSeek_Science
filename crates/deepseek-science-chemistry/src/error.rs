@@ -82,6 +82,13 @@ pub enum KineticsError {
         field: &'static str,
     },
 
+    /// Artifact proposal cannot be converted into a generic manifest.
+    #[error("invalid artifact proposal field: {field}")]
+    InvalidArtifactProposal {
+        /// Invalid proposal field.
+        field: &'static str,
+    },
+
     /// Error raised by shared in-memory table contracts.
     #[error(transparent)]
     Common(#[from] CommonError),

@@ -1,11 +1,13 @@
 //! In-memory input validation for chemistry kinetics workflows.
 
-use deepseek_science_artifacts::{hash_bytes, ArtifactKind, ProvenanceRecord, ReviewStatus};
+use deepseek_science_artifacts::{
+    hash_bytes, ArtifactKind, ArtifactManifest, ProvenanceRecord, ReviewStatus,
+};
 use deepseek_science_common::{
     simple_linear_regression, ColumnName, CommonError, DataColumn, DataTable,
 };
 use deepseek_science_core::{
-    WorkflowId, WorkflowPlan, WorkflowStepKey, WorkflowStepKind, WorkflowStepPlan,
+    ArtifactId, WorkflowId, WorkflowPlan, WorkflowStepKey, WorkflowStepKind, WorkflowStepPlan,
 };
 
 use crate::error::KineticsError;
@@ -400,6 +402,29 @@ impl KineticsArtifactProposal {
             input_hashes: Vec::new(),
             provenance,
             review_status: artifact_review_status(analysis.review_status()),
+        })
+    }
+
+    /// Converts this in-memory proposal into a generic artifact manifest.
+    ///
+    /// The caller supplies the artifact id so conversion remains deterministic
+    /// and does not allocate random ids, write files, call storage, or create a
+    /// persisted artifact.
+    pub fn to_manifest(&self, artifact_id: ArtifactId) -> Result<ArtifactManifest, KineticsError> {
+        if self.content_hash.trim().is_empty() {
+            return Err(KineticsError::InvalidArtifactProposal {
+                field: "content_hash",
+            });
+        }
+
+        Ok(ArtifactManifest {
+            id: artifact_id,
+            kind: self.kind,
+            title: self.title.clone(),
+            input_hashes: self.input_hashes.clone(),
+            content_hash: self.content_hash.clone(),
+            provenance: self.provenance.clone(),
+            review_status: self.review_status,
         })
     }
 }
@@ -872,8 +897,8 @@ mod tests {
     use deepseek_science_artifacts::{ArtifactKind, ReviewStatus};
     use deepseek_science_common::{DataColumn, DataTable};
     use deepseek_science_core::{
-        AgentRun, CoreError, CoreEventEnvelope, RunId, RunInspection, RunState, ThreadId,
-        WorkflowStepKey, WorkflowStepKind,
+        AgentRun, ArtifactId, CoreError, CoreEventEnvelope, RunId, RunInspection, RunState,
+        ThreadId, WorkflowStepKey, WorkflowStepKind,
     };
 
     use crate::{
@@ -913,6 +938,14 @@ mod tests {
             "00000000-0000-0000-0000-000000000202"
                 .parse()
                 .expect("test thread id should parse"),
+        )
+    }
+
+    fn fixed_artifact_id() -> ArtifactId {
+        ArtifactId::from_uuid(
+            "00000000-0000-0000-0000-000000000303"
+                .parse()
+                .expect("test artifact id should parse"),
         )
     }
 
@@ -1997,5 +2030,108 @@ mod tests {
             proposal.provenance[0].note.as_deref(),
             Some("workflow=chemistry.kinetics_csv;step=produce_analysis_result;source=DataTable")
         );
+    }
+
+    #[test]
+    fn artifact_proposal_converts_to_manifest() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("manifest conversion should succeed");
+
+        assert_eq!(manifest.id, fixed_artifact_id());
+        assert_eq!(manifest.title, proposal.title);
+    }
+
+    #[test]
+    fn artifact_manifest_uses_generic_json_kind() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("manifest conversion should succeed");
+
+        assert_eq!(manifest.kind, ArtifactKind::Json);
+    }
+
+    #[test]
+    fn artifact_manifest_content_hash_equals_proposal_content_hash() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("manifest conversion should succeed");
+
+        assert_eq!(manifest.content_hash, proposal.content_hash);
+    }
+
+    #[test]
+    fn artifact_manifest_review_status_matches_proposal_review_status() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&warning_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("manifest conversion should succeed");
+
+        assert_eq!(manifest.review_status, proposal.review_status);
+        assert_eq!(manifest.review_status, ReviewStatus::PassedWithWarnings);
+    }
+
+    #[test]
+    fn artifact_manifest_provenance_contains_workflow_id() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("manifest conversion should succeed");
+
+        assert_eq!(manifest.provenance, proposal.provenance);
+        assert!(manifest
+            .provenance
+            .iter()
+            .filter_map(|record| record.note.as_deref())
+            .any(|note| note.contains(CHEMISTRY_KINETICS_CSV_WORKFLOW_ID)));
+    }
+
+    #[test]
+    fn artifact_manifest_conversion_preserves_in_memory_metadata_without_storage_or_file_io() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("manifest conversion should succeed");
+
+        assert!(manifest.input_hashes.is_empty());
+        assert!(manifest
+            .provenance
+            .iter()
+            .all(|record| record.model_call_id.is_none() && record.tool_call_id.is_none()));
+        assert!(!manifest
+            .provenance
+            .iter()
+            .filter_map(|record| record.note.as_deref())
+            .any(|note| note.contains('/')));
+    }
+
+    #[test]
+    fn repeated_artifact_manifest_conversion_with_same_id_is_deterministic() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        let first = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("first manifest conversion should succeed");
+        let second = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("second manifest conversion should succeed");
+
+        assert_eq!(first, second);
     }
 }
