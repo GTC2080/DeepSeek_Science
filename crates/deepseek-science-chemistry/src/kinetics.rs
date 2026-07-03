@@ -91,6 +91,52 @@ impl KineticsFitResult {
     }
 }
 
+/// Basis used by the deterministic MVP comparison summary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KineticsComparisonBasis {
+    /// Compare finite `r_squared` values only as an MVP heuristic.
+    FiniteRSquaredMvpHeuristic,
+}
+
+/// Cautious comparison summary for the two MVP linearized kinetics fits.
+///
+/// This is not definitive scientific model selection. It records which model
+/// is preferred by the finite `r_squared` MVP heuristic. Exact ties prefer
+/// [`KineticsModelKind::FirstOrder`] for deterministic replay.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KineticsModelComparison {
+    /// First-order linearized fit result.
+    pub first_order: KineticsFitResult,
+    /// Second-order linearized fit result.
+    pub second_order: KineticsFitResult,
+    /// Model preferred by the MVP comparison heuristic.
+    pub preferred_model: KineticsModelKind,
+    /// Comparison basis used to derive the preference.
+    pub basis: KineticsComparisonBasis,
+}
+
+impl KineticsModelComparison {
+    /// Fits and compares first-order and second-order MVP linearized models.
+    pub fn from_input(input: &ValidatedKineticsInput) -> Result<Self, KineticsError> {
+        let first_order = KineticsFitResult::fit(input, KineticsModelKind::FirstOrder)?;
+        let second_order = KineticsFitResult::fit(input, KineticsModelKind::SecondOrder)?;
+        let first_r_squared = comparison_metric(first_order)?;
+        let second_r_squared = comparison_metric(second_order)?;
+        let preferred_model = if second_r_squared > first_r_squared {
+            KineticsModelKind::SecondOrder
+        } else {
+            KineticsModelKind::FirstOrder
+        };
+
+        Ok(Self {
+            first_order,
+            second_order,
+            preferred_model,
+            basis: KineticsComparisonBasis::FiniteRSquaredMvpHeuristic,
+        })
+    }
+}
+
 /// Exact caller-provided column names for kinetics input data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KineticsColumns {
@@ -277,13 +323,24 @@ fn transformed_y(
     Ok(transformed)
 }
 
+fn comparison_metric(fit: KineticsFitResult) -> Result<f64, KineticsError> {
+    if !fit.r_squared.is_finite() || !fit.rate_constant_k.is_finite() {
+        return Err(KineticsError::NonFiniteComparisonMetric {
+            model_kind: fit.model_kind,
+        });
+    }
+
+    Ok(fit.r_squared)
+}
+
 #[cfg(test)]
 mod tests {
     use deepseek_science_common::{DataColumn, DataTable};
 
     use crate::{
-        KineticsColumns, KineticsError, KineticsFitResult, KineticsModelKind,
-        RejectedKineticsRowReason, ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+        KineticsColumns, KineticsComparisonBasis, KineticsError, KineticsFitResult,
+        KineticsModelComparison, KineticsModelKind, RejectedKineticsRowReason,
+        ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -598,5 +655,148 @@ mod tests {
 
         assert_eq!(first.model_kind, KineticsModelKind::FirstOrder);
         assert_eq!(second.model_kind, KineticsModelKind::SecondOrder);
+    }
+
+    #[test]
+    fn comparison_fits_both_first_order_and_second_order_models() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.5_f64).exp(), (-1.0_f64).exp(), (-1.5_f64).exp()],
+        );
+
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should fit both models");
+
+        assert_eq!(
+            comparison.first_order.model_kind,
+            KineticsModelKind::FirstOrder
+        );
+        assert_eq!(
+            comparison.second_order.model_kind,
+            KineticsModelKind::SecondOrder
+        );
+    }
+
+    #[test]
+    fn comparison_prefers_first_order_when_first_order_r_squared_is_higher() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.5_f64).exp(), (-1.0_f64).exp(), (-1.5_f64).exp()],
+        );
+
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        assert_eq!(comparison.preferred_model, KineticsModelKind::FirstOrder);
+        assert!(
+            comparison.first_order.r_squared > comparison.second_order.r_squared,
+            "first-order r_squared should drive the MVP preference"
+        );
+    }
+
+    #[test]
+    fn comparison_prefers_second_order_when_second_order_r_squared_is_higher() {
+        let input = validated_input(&[0.0, 1.0, 2.0, 3.0], &[2.0, 1.0 / 0.75, 1.0, 1.0 / 1.25]);
+
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        assert_eq!(comparison.preferred_model, KineticsModelKind::SecondOrder);
+        assert!(
+            comparison.second_order.r_squared > comparison.first_order.r_squared,
+            "second-order r_squared should drive the MVP preference"
+        );
+    }
+
+    #[test]
+    fn comparison_tie_behavior_prefers_first_order_deterministically() {
+        let input = validated_input(&[0.0, 1.0], &[1.0, 0.5]);
+
+        let comparison = KineticsModelComparison::from_input(&input)
+            .expect("two-point comparison should succeed");
+
+        assert_near(
+            comparison.first_order.r_squared,
+            comparison.second_order.r_squared,
+        );
+        assert_eq!(comparison.preferred_model, KineticsModelKind::FirstOrder);
+    }
+
+    #[test]
+    fn selected_model_is_based_on_finite_r_squared_mvp_heuristic_only() {
+        let input = validated_input(&[0.0, 1.0, 2.0, 3.0], &[2.0, 1.0 / 0.75, 1.0, 1.0 / 1.25]);
+
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        assert_eq!(
+            comparison.basis,
+            KineticsComparisonBasis::FiniteRSquaredMvpHeuristic
+        );
+        assert!(comparison.first_order.r_squared.is_finite());
+        assert!(comparison.second_order.r_squared.is_finite());
+        assert_eq!(comparison.preferred_model, KineticsModelKind::SecondOrder);
+    }
+
+    #[test]
+    fn comparison_preserves_access_to_both_fit_results() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp(), (-0.75_f64).exp()],
+        );
+
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        assert_near(comparison.first_order.rate_constant_k, 0.25);
+        assert_eq!(
+            comparison.second_order.model_kind,
+            KineticsModelKind::SecondOrder
+        );
+    }
+
+    #[test]
+    fn comparison_public_names_remain_cautious() {
+        let comparison_name = "KineticsModelComparison";
+        let basis_name = format!("{:?}", KineticsComparisonBasis::FiniteRSquaredMvpHeuristic);
+
+        assert!(basis_name.contains("Mvp"));
+        assert!(basis_name.contains("Heuristic"));
+        for name in [comparison_name, basis_name.as_str()] {
+            assert!(!name.contains("True"));
+            assert!(!name.contains("Best"));
+            assert!(!name.contains("Final"));
+            assert!(!name.contains("Prove"));
+            assert!(!name.contains("Determine"));
+        }
+    }
+
+    #[test]
+    fn repeated_comparison_with_same_input_is_deterministic() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp(), (-0.75_f64).exp()],
+        );
+
+        let first =
+            KineticsModelComparison::from_input(&input).expect("first comparison should succeed");
+        let second =
+            KineticsModelComparison::from_input(&input).expect("second comparison should succeed");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn comparison_uses_in_memory_table_without_csv_or_file_io() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let comparison = KineticsModelComparison::from_input(&input)
+            .expect("in-memory comparison should succeed");
+
+        assert_eq!(comparison.first_order.valid_point_count, 3);
+        assert_eq!(comparison.second_order.valid_point_count, 3);
     }
 }

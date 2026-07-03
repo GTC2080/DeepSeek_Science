@@ -13,6 +13,7 @@ pub mod kinetics;
 
 pub use error::KineticsError;
 pub use kinetics::{
-    KineticsColumns, KineticsFitResult, KineticsModelKind, KineticsPoint, RejectedKineticsRow,
-    RejectedKineticsRowReason, ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+    KineticsColumns, KineticsComparisonBasis, KineticsFitResult, KineticsModelComparison,
+    KineticsModelKind, KineticsPoint, RejectedKineticsRow, RejectedKineticsRowReason,
+    ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
 };
