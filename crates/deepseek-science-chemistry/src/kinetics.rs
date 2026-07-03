@@ -1,8 +1,10 @@
 //! In-memory input validation for chemistry kinetics workflows.
 
-use deepseek_science_common::{ColumnName, CommonError, DataColumn, DataTable};
+use deepseek_science_common::{
+    simple_linear_regression, ColumnName, CommonError, DataColumn, DataTable,
+};
 
-use crate::KineticsError;
+use crate::error::KineticsError;
 
 /// Workflow identifier reserved for the future chemistry kinetics CSV workflow.
 ///
@@ -11,6 +13,83 @@ use crate::KineticsError;
 pub const CHEMISTRY_KINETICS_CSV_WORKFLOW_ID: &str = "chemistry.kinetics_csv";
 
 const MINIMUM_VALID_POINTS: usize = 2;
+
+/// Supported deterministic linearized kinetics models.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KineticsModelKind {
+    /// First-order model: `ln(concentration)` vs `time`.
+    FirstOrder,
+    /// Second-order model: `1 / concentration` vs `time`.
+    SecondOrder,
+}
+
+/// Deterministic linearized fit result for one kinetics model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KineticsFitResult {
+    /// Model fitted.
+    pub model_kind: KineticsModelKind,
+    /// Fitted linearized regression slope.
+    pub slope: f64,
+    /// Fitted linearized regression intercept.
+    pub intercept: f64,
+    /// Model-specific rate constant derived from the slope.
+    pub rate_constant_k: f64,
+    /// Coefficient of determination from the linearized regression.
+    pub r_squared: f64,
+    /// Number of validated input points used by the fit.
+    pub valid_point_count: usize,
+}
+
+impl KineticsFitResult {
+    /// Fits one deterministic linearized kinetics model over validated input.
+    pub fn fit(
+        input: &ValidatedKineticsInput,
+        model_kind: KineticsModelKind,
+    ) -> Result<Self, KineticsError> {
+        if input.valid_count() < MINIMUM_VALID_POINTS {
+            return Err(KineticsError::NotEnoughValidPoints {
+                valid_count: input.valid_count(),
+                minimum_required: MINIMUM_VALID_POINTS,
+            });
+        }
+
+        let mut x_values = Vec::with_capacity(input.valid_count());
+        let mut y_values = Vec::with_capacity(input.valid_count());
+
+        for point in input.valid_points() {
+            x_values.push(point.time);
+            y_values.push(transformed_y(*point, model_kind)?);
+        }
+
+        let regression = simple_linear_regression(&x_values, &y_values)
+            .map_err(|source| KineticsError::RegressionFailed { model_kind, source })?;
+        let rate_constant_k = match model_kind {
+            KineticsModelKind::FirstOrder => -regression.slope,
+            KineticsModelKind::SecondOrder => regression.slope,
+        };
+
+        if [
+            regression.slope,
+            regression.intercept,
+            regression.r_squared,
+            rate_constant_k,
+        ]
+        .iter()
+        .any(|value| !value.is_finite())
+        {
+            return Err(KineticsError::NonFiniteFitResult { model_kind });
+        }
+
+        Ok(Self {
+            model_kind,
+            slope: regression.slope,
+            intercept: regression.intercept,
+            rate_constant_k,
+            r_squared: regression.r_squared,
+            valid_point_count: input.valid_count(),
+        })
+    }
+}
 
 /// Exact caller-provided column names for kinetics input data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -172,13 +251,39 @@ fn concentration_column<'a>(
         })
 }
 
+fn transformed_y(
+    point: KineticsPoint,
+    model_kind: KineticsModelKind,
+) -> Result<f64, KineticsError> {
+    if point.concentration <= 0.0 {
+        return Err(KineticsError::InvalidConcentrationForTransform {
+            model_kind,
+            row_index: point.row_index,
+        });
+    }
+
+    let transformed = match model_kind {
+        KineticsModelKind::FirstOrder => point.concentration.ln(),
+        KineticsModelKind::SecondOrder => 1.0 / point.concentration,
+    };
+
+    if !transformed.is_finite() {
+        return Err(KineticsError::NonFiniteTransformedValue {
+            model_kind,
+            row_index: point.row_index,
+        });
+    }
+
+    Ok(transformed)
+}
+
 #[cfg(test)]
 mod tests {
     use deepseek_science_common::{DataColumn, DataTable};
 
     use crate::{
-        KineticsColumns, KineticsError, RejectedKineticsRowReason, ValidatedKineticsInput,
-        CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+        KineticsColumns, KineticsError, KineticsFitResult, KineticsModelKind,
+        RejectedKineticsRowReason, ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -195,6 +300,20 @@ mod tests {
 
     fn kinetics_columns() -> KineticsColumns {
         KineticsColumns::new("time", "concentration").expect("test columns should be valid")
+    }
+
+    fn validated_input(time: &[f64], concentration: &[f64]) -> ValidatedKineticsInput {
+        let table = kinetics_table(time, concentration);
+        ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("test input should be valid")
+    }
+
+    fn assert_near(actual: f64, expected: f64) {
+        let tolerance = 1.0e-12;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "expected {actual} to be within {tolerance} of {expected}"
+        );
     }
 
     #[test]
@@ -326,5 +445,158 @@ mod tests {
                 name: "concentration".to_string()
             })
         );
+    }
+
+    #[test]
+    fn first_order_fit_recovers_expected_rate_constant_for_exact_data() {
+        let k = 0.5;
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[
+                1.0,
+                (-k * 1.0_f64).exp(),
+                (-k * 2.0_f64).exp(),
+                (-k * 3.0_f64).exp(),
+            ],
+        );
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("first-order fit should succeed");
+
+        assert_eq!(fit.model_kind, KineticsModelKind::FirstOrder);
+        assert_near(fit.rate_constant_k, k);
+        assert_eq!(fit.valid_point_count, 4);
+    }
+
+    #[test]
+    fn second_order_fit_recovers_expected_rate_constant_for_exact_data() {
+        let intercept = 0.5;
+        let k = 0.25;
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[
+                1.0 / (intercept + k * 0.0),
+                1.0 / (intercept + k * 1.0),
+                1.0 / (intercept + k * 2.0),
+                1.0 / (intercept + k * 3.0),
+            ],
+        );
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::SecondOrder)
+            .expect("second-order fit should succeed");
+
+        assert_eq!(fit.model_kind, KineticsModelKind::SecondOrder);
+        assert_near(fit.rate_constant_k, k);
+        assert_eq!(fit.valid_point_count, 4);
+    }
+
+    #[test]
+    fn first_order_rate_constant_is_negative_slope() {
+        let input = validated_input(&[0.0, 1.0, 2.0], &[1.0, 0.5_f64.exp(), 1.0_f64.exp()]);
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("first-order fit should succeed");
+
+        assert_near(fit.slope, 0.5);
+        assert_near(fit.rate_constant_k, -fit.slope);
+    }
+
+    #[test]
+    fn second_order_rate_constant_is_slope() {
+        let input = validated_input(&[0.0, 1.0, 2.0], &[1.0, 1.0 / 1.5, 0.5]);
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::SecondOrder)
+            .expect("second-order fit should succeed");
+
+        assert_near(fit.slope, 0.5);
+        assert_near(fit.rate_constant_k, fit.slope);
+    }
+
+    #[test]
+    fn r_squared_is_finite_and_near_one_for_exact_linearized_data() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("first-order fit should succeed");
+
+        assert!(fit.r_squared.is_finite());
+        assert_near(fit.r_squared, 1.0);
+    }
+
+    #[test]
+    fn fit_uses_only_valid_points_after_non_positive_concentration_rejection() {
+        let table = kinetics_table(
+            &[0.0, 99.0, 1.0, 2.0],
+            &[1.0, 0.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("two valid positive concentrations should remain");
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("first-order fit should ignore rejected rows");
+
+        assert_eq!(input.rejected_count(), 1);
+        assert_eq!(input.rejected_rows()[0].row_index, 1);
+        assert_eq!(fit.valid_point_count, 3);
+        assert_near(fit.rate_constant_k, 0.25);
+    }
+
+    #[test]
+    fn fit_requires_at_least_two_valid_points() {
+        let table = kinetics_table(&[0.0, 1.0, 2.0], &[0.0, -1.0, 1.0]);
+
+        let result = ValidatedKineticsInput::from_table(&table, &kinetics_columns());
+
+        assert_eq!(
+            result,
+            Err(KineticsError::NotEnoughValidPoints {
+                valid_count: 1,
+                minimum_required: 2
+            })
+        );
+    }
+
+    #[test]
+    fn repeated_fit_with_same_input_is_deterministic() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let first = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("first fit should succeed");
+        let second = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("second fit should succeed");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn fitting_uses_in_memory_table_without_csv_or_file_io() {
+        let input = validated_input(&[0.0, 1.0], &[1.0, (-0.25_f64).exp()]);
+
+        let fit = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("in-memory fit should succeed");
+
+        assert_near(fit.rate_constant_k, 0.25);
+    }
+
+    #[test]
+    fn fit_result_does_not_select_a_model_comparison_winner() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let first = KineticsFitResult::fit(&input, KineticsModelKind::FirstOrder)
+            .expect("first-order fit should succeed");
+        let second = KineticsFitResult::fit(&input, KineticsModelKind::SecondOrder)
+            .expect("second-order fit should succeed");
+
+        assert_eq!(first.model_kind, KineticsModelKind::FirstOrder);
+        assert_eq!(second.model_kind, KineticsModelKind::SecondOrder);
     }
 }
