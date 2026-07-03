@@ -894,7 +894,7 @@ fn workflow_step(
 
 #[cfg(test)]
 mod tests {
-    use deepseek_science_artifacts::{ArtifactKind, ReviewStatus};
+    use deepseek_science_artifacts::{ArtifactKind, ArtifactManifest, ReviewStatus};
     use deepseek_science_common::{DataColumn, DataTable};
     use deepseek_science_core::{
         AgentRun, ArtifactId, CoreError, CoreEventEnvelope, RunId, RunInspection, RunState,
@@ -989,6 +989,30 @@ mod tests {
             .expect("two valid positive concentrations should remain");
 
         KineticsAnalysisResult::analyze(&input).expect("analysis should succeed")
+    }
+
+    fn in_memory_pipeline_manifest(
+        time: &[f64],
+        concentration: &[f64],
+        artifact_id: ArtifactId,
+    ) -> (
+        ValidatedKineticsInput,
+        KineticsAnalysisResult,
+        KineticsArtifactProposal,
+        ArtifactManifest,
+    ) {
+        let table = kinetics_table(time, concentration);
+        let columns = kinetics_columns();
+        let input = ValidatedKineticsInput::from_table(&table, &columns)
+            .expect("pipeline input should validate");
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("pipeline should analyze");
+        let proposal = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("pipeline should propose artifact metadata");
+        let manifest = proposal
+            .to_manifest(artifact_id)
+            .expect("pipeline should convert proposal to manifest");
+
+        (input, analysis, proposal, manifest)
     }
 
     fn assert_near(actual: f64, expected: f64) {
@@ -2133,5 +2157,111 @@ mod tests {
             .expect("second manifest conversion should succeed");
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn clean_end_to_end_in_memory_pipeline_produces_artifact_manifest() {
+        let table = kinetics_table(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let columns = kinetics_columns();
+        let input = ValidatedKineticsInput::from_table(&table, &columns)
+            .expect("pipeline input should validate");
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("pipeline should analyze");
+        let proposal = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("pipeline should propose artifact metadata");
+        let manifest = proposal
+            .to_manifest(fixed_artifact_id())
+            .expect("pipeline should convert proposal to manifest");
+
+        assert_eq!(input.valid_count(), 3);
+        assert_eq!(analysis.valid_point_count(), input.valid_count());
+        assert_eq!(analysis.rejected_row_count(), 0);
+        assert_eq!(
+            analysis.comparison_basis,
+            KineticsComparisonBasis::FiniteRSquaredMvpHeuristic
+        );
+        assert_eq!(analysis.preferred_model(), KineticsModelKind::FirstOrder);
+        assert_eq!(analysis.review_status(), KineticsReviewStatus::Passed);
+        assert_eq!(proposal.kind, ArtifactKind::Json);
+        assert_eq!(proposal.review_status, ReviewStatus::Passed);
+        assert_eq!(manifest.id, fixed_artifact_id());
+        assert_eq!(manifest.kind, ArtifactKind::Json);
+        assert_eq!(manifest.content_hash, proposal.content_hash);
+        assert_eq!(manifest.review_status, proposal.review_status);
+    }
+
+    #[test]
+    fn rejected_row_end_to_end_pipeline_preserves_warning_visibility() {
+        let (input, analysis, proposal, manifest) = in_memory_pipeline_manifest(
+            &[0.0, 99.0, 1.0, 2.0],
+            &[1.0, 0.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+            fixed_artifact_id(),
+        );
+
+        assert_eq!(input.valid_count(), 3);
+        assert_eq!(input.rejected_count(), 1);
+        assert_eq!(input.rejected_rows()[0].row_index, 1);
+        assert_eq!(analysis.rejected_row_count(), 1);
+        assert_eq!(
+            analysis.review_status(),
+            KineticsReviewStatus::PassedWithWarnings
+        );
+        assert!(analysis.has_warnings());
+        assert!(analysis.review.findings.iter().any(|finding| {
+            finding.check_kind == KineticsReviewCheckKind::RejectedRowsVisible
+                && finding.rejected_row_count == Some(1)
+        }));
+        assert_eq!(proposal.review_status, ReviewStatus::PassedWithWarnings);
+        assert_eq!(manifest.kind, ArtifactKind::Json);
+        assert_eq!(manifest.review_status, ReviewStatus::PassedWithWarnings);
+        assert_eq!(manifest.content_hash, proposal.content_hash);
+    }
+
+    #[test]
+    fn repeated_end_to_end_pipeline_with_same_artifact_id_is_deterministic() {
+        let first = in_memory_pipeline_manifest(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+            fixed_artifact_id(),
+        );
+        let second = in_memory_pipeline_manifest(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+            fixed_artifact_id(),
+        );
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn end_to_end_pipeline_requires_no_file_io_model_tool_storage_or_workflow_execution() {
+        let (_input, analysis, proposal, manifest) = in_memory_pipeline_manifest(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+            fixed_artifact_id(),
+        );
+
+        assert_eq!(analysis.rejected_row_count(), 0);
+        assert!(proposal.input_hashes.is_empty());
+        assert!(manifest.input_hashes.is_empty());
+        assert!(manifest.provenance.iter().all(|record| {
+            record.run_id.is_none()
+                && record.model_call_id.is_none()
+                && record.tool_call_id.is_none()
+                && record.prompt_prefix_hash.is_none()
+                && record.source_artifact_ids.is_empty()
+        }));
+        assert!(manifest
+            .provenance
+            .iter()
+            .filter_map(|record| record.note.as_deref())
+            .any(|note| note.contains("source=DataTable")));
+        assert!(!manifest
+            .provenance
+            .iter()
+            .filter_map(|record| record.note.as_deref())
+            .any(|note| note.contains('/')));
     }
 }
