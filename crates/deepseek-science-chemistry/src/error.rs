@@ -67,6 +67,13 @@ pub enum KineticsError {
         model_kind: KineticsModelKind,
     },
 
+    /// Comparison received a non-finite MVP metric from a fit result.
+    #[error("non-finite comparison metric for {model_kind:?}")]
+    NonFiniteComparisonMetric {
+        /// Kinetic model being compared.
+        model_kind: KineticsModelKind,
+    },
+
     /// Error raised by shared in-memory table contracts.
     #[error(transparent)]
     Common(#[from] CommonError),
