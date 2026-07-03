@@ -236,6 +236,81 @@ impl KineticsReview {
     }
 }
 
+/// Structured in-memory kinetics analysis result.
+///
+/// This type composes validated input metadata, MVP linearized model
+/// comparison, and deterministic reviewer output. The preferred model is only
+/// the Phase 2 finite `r_squared` heuristic preference, not a definitive
+/// reaction-order determination.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KineticsAnalysisResult {
+    /// First-order and second-order comparison summary.
+    pub comparison: KineticsModelComparison,
+    /// Deterministic consistency review for the comparison.
+    pub review: KineticsReview,
+    /// Count of validated positive-concentration input points.
+    pub valid_point_count: usize,
+    /// Count of rows rejected during input validation.
+    pub rejected_row_count: usize,
+    /// Model preferred by the MVP comparison heuristic.
+    pub preferred_model: KineticsModelKind,
+    /// Basis used for the MVP comparison preference.
+    pub comparison_basis: KineticsComparisonBasis,
+}
+
+impl KineticsAnalysisResult {
+    /// Runs deterministic in-memory kinetics analysis over validated input.
+    ///
+    /// This does not parse CSV, read or write files, call models or tools,
+    /// create artifacts, persist storage, or generate prose reports.
+    pub fn analyze(input: &ValidatedKineticsInput) -> Result<Self, KineticsError> {
+        let comparison = KineticsModelComparison::from_input(input)?;
+        let review = KineticsReview::from_input_and_comparison(input, &comparison);
+
+        Ok(Self {
+            valid_point_count: input.valid_count(),
+            rejected_row_count: input.rejected_count(),
+            preferred_model: comparison.preferred_model,
+            comparison_basis: comparison.basis,
+            comparison,
+            review,
+        })
+    }
+
+    /// Returns the number of valid points analyzed.
+    pub fn valid_point_count(&self) -> usize {
+        self.valid_point_count
+    }
+
+    /// Returns the number of rejected input rows.
+    pub fn rejected_row_count(&self) -> usize {
+        self.rejected_row_count
+    }
+
+    /// Returns the model preferred by the MVP heuristic.
+    pub fn preferred_model(&self) -> KineticsModelKind {
+        self.preferred_model
+    }
+
+    /// Returns the comparison basis used for the MVP preference.
+    pub fn comparison_basis(&self) -> KineticsComparisonBasis {
+        self.comparison_basis
+    }
+
+    /// Returns the deterministic review status.
+    pub fn review_status(&self) -> KineticsReviewStatus {
+        self.review.status
+    }
+
+    /// Returns whether the deterministic review contains warnings.
+    pub fn has_warnings(&self) -> bool {
+        self.review
+            .findings
+            .iter()
+            .any(|finding| finding.severity == KineticsReviewSeverity::Warning)
+    }
+}
+
 /// Exact caller-provided column names for kinetics input data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KineticsColumns {
@@ -512,10 +587,10 @@ mod tests {
     use deepseek_science_common::{DataColumn, DataTable};
 
     use crate::{
-        KineticsColumns, KineticsComparisonBasis, KineticsError, KineticsFitResult,
-        KineticsModelComparison, KineticsModelKind, KineticsReview, KineticsReviewCheckKind,
-        KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRowReason,
-        ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+        KineticsAnalysisResult, KineticsColumns, KineticsComparisonBasis, KineticsError,
+        KineticsFitResult, KineticsModelComparison, KineticsModelKind, KineticsReview,
+        KineticsReviewCheckKind, KineticsReviewSeverity, KineticsReviewStatus,
+        RejectedKineticsRowReason, ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -1151,6 +1226,152 @@ mod tests {
             "KineticsReviewStatus",
             "KineticsReviewFinding",
             "KineticsReviewCheckKind",
+        ];
+
+        for name in names {
+            assert!(!name.contains("True"));
+            assert!(!name.contains("Best"));
+            assert!(!name.contains("Final"));
+            assert!(!name.contains("Prove"));
+            assert!(!name.contains("Determine"));
+        }
+    }
+
+    #[test]
+    fn analysis_result_can_be_created_from_valid_input() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(analysis.valid_point_count(), 3);
+    }
+
+    #[test]
+    fn analysis_result_includes_comparison_result() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(
+            analysis.comparison.first_order.model_kind,
+            KineticsModelKind::FirstOrder
+        );
+        assert_eq!(
+            analysis.comparison.second_order.model_kind,
+            KineticsModelKind::SecondOrder
+        );
+    }
+
+    #[test]
+    fn analysis_result_includes_review_result() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(analysis.review.status, KineticsReviewStatus::Passed);
+        assert!(analysis.review.findings.is_empty());
+    }
+
+    #[test]
+    fn analysis_result_preserves_valid_and_rejected_counts() {
+        let table = kinetics_table(
+            &[0.0, 99.0, 1.0, 2.0],
+            &[1.0, 0.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("three valid points should remain");
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(analysis.valid_point_count(), 3);
+        assert_eq!(analysis.rejected_row_count(), 1);
+    }
+
+    #[test]
+    fn analysis_result_exposes_preferred_model_and_basis() {
+        let input = validated_input(&[0.0, 1.0, 2.0, 3.0], &[2.0, 1.0 / 0.75, 1.0, 1.0 / 1.25]);
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(analysis.preferred_model(), KineticsModelKind::SecondOrder);
+        assert_eq!(
+            analysis.comparison_basis,
+            KineticsComparisonBasis::FiniteRSquaredMvpHeuristic
+        );
+    }
+
+    #[test]
+    fn analysis_result_exposes_review_status() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(analysis.review_status(), KineticsReviewStatus::Passed);
+        assert!(!analysis.has_warnings());
+    }
+
+    #[test]
+    fn analysis_result_detects_warnings_when_rejected_rows_exist() {
+        let table = kinetics_table(&[0.0, 99.0, 1.0], &[1.0, 0.0, (-0.25_f64).exp()]);
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("two valid positive concentrations should remain");
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(
+            analysis.review_status(),
+            KineticsReviewStatus::PassedWithWarnings
+        );
+        assert!(analysis.has_warnings());
+    }
+
+    #[test]
+    fn repeated_analysis_with_same_input_is_deterministic() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp(), (-0.75_f64).exp()],
+        );
+
+        let first = KineticsAnalysisResult::analyze(&input).expect("first analysis should succeed");
+        let second =
+            KineticsAnalysisResult::analyze(&input).expect("second analysis should succeed");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn analysis_uses_in_memory_data_without_side_effects() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+
+        assert_eq!(analysis.rejected_row_count(), 0);
+        assert_eq!(analysis.review_status(), KineticsReviewStatus::Passed);
+    }
+
+    #[test]
+    fn analysis_public_names_remain_cautious() {
+        let names = [
+            "KineticsAnalysisResult",
+            "preferred_model",
+            "comparison_basis",
+            "review_status",
+            "has_warnings",
         ];
 
         for name in names {
