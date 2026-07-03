@@ -6,6 +6,7 @@ members = [
     "crates/deepseek-science-prompt",
     "crates/deepseek-science-tools",
     "crates/deepseek-science-common",
+    "crates/deepseek-science-chemistry",
     "crates/deepseek-science-artifacts",
     "crates/deepseek-science-storage",
     "crates/deepseek-science-sandbox",

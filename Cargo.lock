@@ -77,6 +77,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepseek-science-chemistry"
+version = "0.1.0"
+dependencies = [
+ "deepseek-science-common",
+ "thiserror",
+]
+
+[[package]]
 name = "deepseek-science-cli"
 version = "0.1.0"
 dependencies = [
