@@ -3,6 +3,8 @@
 use deepseek_science_common::CommonError;
 use thiserror::Error;
 
+use crate::kinetics::KineticsModelKind;
+
 /// Errors raised while validating chemistry kinetics inputs.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum KineticsError {
@@ -29,6 +31,40 @@ pub enum KineticsError {
         valid_count: usize,
         /// Minimum number of rows required for later deterministic fitting.
         minimum_required: usize,
+    },
+
+    /// A fitting transform received an invalid concentration defensively.
+    #[error("invalid concentration for {model_kind:?} transform at row {row_index}")]
+    InvalidConcentrationForTransform {
+        /// Kinetic model being transformed.
+        model_kind: KineticsModelKind,
+        /// Zero-based row index in the input table.
+        row_index: usize,
+    },
+
+    /// A transformed value was NaN or infinity.
+    #[error("non-finite transformed value for {model_kind:?} at row {row_index}")]
+    NonFiniteTransformedValue {
+        /// Kinetic model being transformed.
+        model_kind: KineticsModelKind,
+        /// Zero-based row index in the input table.
+        row_index: usize,
+    },
+
+    /// Linear regression failed for transformed kinetics data.
+    #[error("linear regression failed for {model_kind:?}: {source}")]
+    RegressionFailed {
+        /// Kinetic model being fitted.
+        model_kind: KineticsModelKind,
+        /// Regression error from shared numerical helpers.
+        source: CommonError,
+    },
+
+    /// Regression returned a non-finite fit value.
+    #[error("non-finite fit result for {model_kind:?}")]
+    NonFiniteFitResult {
+        /// Kinetic model being fitted.
+        model_kind: KineticsModelKind,
     },
 
     /// Error raised by shared in-memory table contracts.
