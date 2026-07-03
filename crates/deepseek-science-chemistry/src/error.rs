@@ -1,6 +1,7 @@
 //! Error types for chemistry workflow contracts.
 
 use deepseek_science_common::CommonError;
+use deepseek_science_core::CoreError;
 use thiserror::Error;
 
 use crate::kinetics::KineticsModelKind;
@@ -77,4 +78,8 @@ pub enum KineticsError {
     /// Error raised by shared in-memory table contracts.
     #[error(transparent)]
     Common(#[from] CommonError),
+
+    /// Error raised while constructing a generic workflow plan.
+    #[error(transparent)]
+    Core(#[from] CoreError),
 }
