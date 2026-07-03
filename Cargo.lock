@@ -81,6 +81,7 @@ name = "deepseek-science-chemistry"
 version = "0.1.0"
 dependencies = [
  "deepseek-science-common",
+ "deepseek-science-core",
  "thiserror",
 ]
 

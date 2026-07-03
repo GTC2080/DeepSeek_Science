@@ -3,6 +3,9 @@
 use deepseek_science_common::{
     simple_linear_regression, ColumnName, CommonError, DataColumn, DataTable,
 };
+use deepseek_science_core::{
+    WorkflowId, WorkflowPlan, WorkflowStepKey, WorkflowStepKind, WorkflowStepPlan,
+};
 
 use crate::error::KineticsError;
 
@@ -14,6 +17,49 @@ pub const CHEMISTRY_KINETICS_CSV_WORKFLOW_ID: &str = "chemistry.kinetics_csv";
 
 const MINIMUM_VALID_POINTS: usize = 2;
 const REVIEW_TOLERANCE: f64 = 1.0e-12;
+
+/// Returns the deterministic generic workflow plan for `chemistry.kinetics_csv`.
+///
+/// The plan is a pure in-memory description for future orchestration. It does
+/// not validate tables, fit models, call models or tools, create artifacts,
+/// persist storage, read files, or write files.
+pub fn kinetics_csv_workflow_plan() -> Result<WorkflowPlan, KineticsError> {
+    WorkflowPlan::new(
+        WorkflowId::new(CHEMISTRY_KINETICS_CSV_WORKFLOW_ID)?,
+        "Chemistry kinetics CSV",
+        vec![
+            workflow_step(
+                "inspect_input",
+                WorkflowStepKind::InspectInput,
+                "Inspect input",
+            )?,
+            workflow_step(
+                "validate_kinetics_input",
+                WorkflowStepKind::Custom,
+                "Validate kinetics input",
+            )?,
+            workflow_step(
+                "fit_first_order",
+                WorkflowStepKind::Custom,
+                "Fit first-order model",
+            )?,
+            workflow_step(
+                "fit_second_order",
+                WorkflowStepKind::Custom,
+                "Fit second-order model",
+            )?,
+            workflow_step("compare_models", WorkflowStepKind::Review, "Compare models")?,
+            workflow_step("review_result", WorkflowStepKind::Review, "Review result")?,
+            workflow_step(
+                "produce_analysis_result",
+                WorkflowStepKind::ProduceArtifact,
+                "Produce analysis result",
+            )?,
+            workflow_step("complete", WorkflowStepKind::Complete, "Complete")?,
+        ],
+    )
+    .map_err(KineticsError::from)
+}
 
 /// Supported deterministic linearized kinetics models.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -582,15 +628,26 @@ fn review_status(findings: &[KineticsReviewFinding]) -> KineticsReviewStatus {
     }
 }
 
+fn workflow_step(
+    key: &str,
+    kind: WorkflowStepKind,
+    label: &str,
+) -> Result<WorkflowStepPlan, KineticsError> {
+    WorkflowStepPlan::new(WorkflowStepKey::new(key)?, kind, label, None)
+        .map_err(KineticsError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use deepseek_science_common::{DataColumn, DataTable};
+    use deepseek_science_core::WorkflowStepKind;
 
     use crate::{
-        KineticsAnalysisResult, KineticsColumns, KineticsComparisonBasis, KineticsError,
-        KineticsFitResult, KineticsModelComparison, KineticsModelKind, KineticsReview,
-        KineticsReviewCheckKind, KineticsReviewSeverity, KineticsReviewStatus,
-        RejectedKineticsRowReason, ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+        kinetics_csv_workflow_plan, KineticsAnalysisResult, KineticsColumns,
+        KineticsComparisonBasis, KineticsError, KineticsFitResult, KineticsModelComparison,
+        KineticsModelKind, KineticsReview, KineticsReviewCheckKind, KineticsReviewSeverity,
+        KineticsReviewStatus, RejectedKineticsRowReason, ValidatedKineticsInput,
+        CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -1380,6 +1437,97 @@ mod tests {
             assert!(!name.contains("Final"));
             assert!(!name.contains("Prove"));
             assert!(!name.contains("Determine"));
+        }
+    }
+
+    #[test]
+    fn workflow_plan_has_chemistry_kinetics_csv_id() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+
+        assert_eq!(plan.id().as_str(), CHEMISTRY_KINETICS_CSV_WORKFLOW_ID);
+        assert_eq!(plan.name(), "Chemistry kinetics CSV");
+    }
+
+    #[test]
+    fn workflow_plan_has_deterministic_ordered_steps() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+        let keys: Vec<_> = plan.step_keys().map(|key| key.as_str()).collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "inspect_input",
+                "validate_kinetics_input",
+                "fit_first_order",
+                "fit_second_order",
+                "compare_models",
+                "review_result",
+                "produce_analysis_result",
+                "complete",
+            ]
+        );
+    }
+
+    #[test]
+    fn workflow_plan_uses_generic_step_kinds_without_chemistry_core_variants() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+        let kinds: Vec<_> = plan.steps().iter().map(|step| step.kind()).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                WorkflowStepKind::InspectInput,
+                WorkflowStepKind::Custom,
+                WorkflowStepKind::Custom,
+                WorkflowStepKind::Custom,
+                WorkflowStepKind::Review,
+                WorkflowStepKind::Review,
+                WorkflowStepKind::ProduceArtifact,
+                WorkflowStepKind::Complete,
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_workflow_plan_calls_are_equivalent() {
+        let first = kinetics_csv_workflow_plan().expect("first plan should construct");
+        let second = kinetics_csv_workflow_plan().expect("second plan should construct");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn workflow_plan_construction_does_not_execute_analysis() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+
+        assert_eq!(plan.step_count(), 8);
+        assert_eq!(plan.steps()[2].key().as_str(), "fit_first_order");
+        assert_eq!(plan.steps()[3].key().as_str(), "fit_second_order");
+    }
+
+    #[test]
+    fn workflow_plan_construction_does_not_require_data_table_or_csv_io() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+
+        assert_eq!(plan.steps()[0].key().as_str(), "inspect_input");
+        assert_eq!(plan.steps()[7].key().as_str(), "complete");
+    }
+
+    #[test]
+    fn workflow_plan_public_names_remain_execution_free() {
+        let names = [
+            "kinetics_csv_workflow_plan",
+            "inspect_input",
+            "validate_kinetics_input",
+            "produce_analysis_result",
+        ];
+
+        for name in names {
+            assert!(!name.contains("execute"));
+            assert!(!name.contains("read_file"));
+            assert!(!name.contains("write_file"));
+            assert!(!name.contains("call_model"));
+            assert!(!name.contains("call_tool"));
         }
     }
 }
