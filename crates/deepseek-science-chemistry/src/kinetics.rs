@@ -13,6 +13,7 @@ use crate::error::KineticsError;
 pub const CHEMISTRY_KINETICS_CSV_WORKFLOW_ID: &str = "chemistry.kinetics_csv";
 
 const MINIMUM_VALID_POINTS: usize = 2;
+const REVIEW_TOLERANCE: f64 = 1.0e-12;
 
 /// Supported deterministic linearized kinetics models.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +135,104 @@ impl KineticsModelComparison {
             preferred_model,
             basis: KineticsComparisonBasis::FiniteRSquaredMvpHeuristic,
         })
+    }
+}
+
+/// Deterministic reviewer status for kinetics comparison checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KineticsReviewStatus {
+    /// All deterministic checks passed without findings.
+    Passed,
+    /// Checks passed with non-fatal warnings.
+    PassedWithWarnings,
+    /// One or more deterministic consistency checks failed.
+    Failed,
+}
+
+/// Severity of a deterministic kinetics review finding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KineticsReviewSeverity {
+    /// Non-fatal issue that should remain visible to callers.
+    Warning,
+    /// Internal consistency failure.
+    Error,
+}
+
+/// Deterministic check represented by a kinetics review finding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KineticsReviewCheckKind {
+    /// Rate constant follows the model-specific slope convention.
+    RateConstantMatchesSlope,
+    /// Fit metrics are finite.
+    FiniteMetrics,
+    /// Rejected rows remain visible in the review.
+    RejectedRowsVisible,
+    /// Comparison basis is the finite `r_squared` MVP heuristic.
+    ComparisonBasisIsHeuristic,
+}
+
+/// Structured finding from deterministic kinetics review checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KineticsReviewFinding {
+    /// Finding severity.
+    pub severity: KineticsReviewSeverity,
+    /// Deterministic check that produced the finding.
+    pub check_kind: KineticsReviewCheckKind,
+    /// Model associated with the finding, when model-specific.
+    pub model_kind: Option<KineticsModelKind>,
+    /// Rejected row count associated with the finding, when relevant.
+    pub rejected_row_count: Option<usize>,
+    /// Short stable explanation for the finding.
+    pub message: &'static str,
+}
+
+/// Deterministic review of an in-memory kinetics comparison.
+///
+/// This review checks internal consistency only. It does not make definitive
+/// scientific model-selection claims and does not call models, tools, files,
+/// storage, or artifacts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KineticsReview {
+    /// Overall deterministic review status.
+    pub status: KineticsReviewStatus,
+    /// Structured warnings or errors found by the reviewer.
+    pub findings: Vec<KineticsReviewFinding>,
+    /// Number of deterministic checks performed.
+    pub checks_performed: usize,
+    /// Rejected row count preserved from the validated input.
+    pub rejected_row_count: usize,
+}
+
+impl KineticsReview {
+    /// Reviews an existing comparison without rerunning fitting.
+    pub fn from_input_and_comparison(
+        input: &ValidatedKineticsInput,
+        comparison: &KineticsModelComparison,
+    ) -> Self {
+        let mut findings = Vec::new();
+        let mut checks_performed = 0;
+
+        review_fit_metrics(comparison.first_order, &mut findings);
+        checks_performed += 1;
+        review_fit_metrics(comparison.second_order, &mut findings);
+        checks_performed += 1;
+        review_rate_constant(comparison.first_order, &mut findings);
+        checks_performed += 1;
+        review_rate_constant(comparison.second_order, &mut findings);
+        checks_performed += 1;
+        review_comparison_basis(comparison.basis, &mut findings);
+        checks_performed += 1;
+        review_rejected_rows(input.rejected_count(), &mut findings);
+        checks_performed += 1;
+
+        let status = review_status(&findings);
+
+        Self {
+            status,
+            findings,
+            checks_performed,
+            rejected_row_count: input.rejected_count(),
+        }
     }
 }
 
@@ -333,13 +432,89 @@ fn comparison_metric(fit: KineticsFitResult) -> Result<f64, KineticsError> {
     Ok(fit.r_squared)
 }
 
+fn review_fit_metrics(fit: KineticsFitResult, findings: &mut Vec<KineticsReviewFinding>) {
+    if [fit.slope, fit.intercept, fit.rate_constant_k, fit.r_squared]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        findings.push(KineticsReviewFinding {
+            severity: KineticsReviewSeverity::Error,
+            check_kind: KineticsReviewCheckKind::FiniteMetrics,
+            model_kind: Some(fit.model_kind),
+            rejected_row_count: None,
+            message: "fit metrics must be finite",
+        });
+    }
+}
+
+fn review_rate_constant(fit: KineticsFitResult, findings: &mut Vec<KineticsReviewFinding>) {
+    let expected = match fit.model_kind {
+        KineticsModelKind::FirstOrder => -fit.slope,
+        KineticsModelKind::SecondOrder => fit.slope,
+    };
+
+    if (fit.rate_constant_k - expected).abs() > REVIEW_TOLERANCE {
+        findings.push(KineticsReviewFinding {
+            severity: KineticsReviewSeverity::Error,
+            check_kind: KineticsReviewCheckKind::RateConstantMatchesSlope,
+            model_kind: Some(fit.model_kind),
+            rejected_row_count: None,
+            message: "rate constant must match the model slope convention",
+        });
+    }
+}
+
+fn review_comparison_basis(
+    basis: KineticsComparisonBasis,
+    findings: &mut Vec<KineticsReviewFinding>,
+) {
+    if basis != KineticsComparisonBasis::FiniteRSquaredMvpHeuristic {
+        findings.push(KineticsReviewFinding {
+            severity: KineticsReviewSeverity::Error,
+            check_kind: KineticsReviewCheckKind::ComparisonBasisIsHeuristic,
+            model_kind: None,
+            rejected_row_count: None,
+            message: "comparison basis must remain the MVP r_squared heuristic",
+        });
+    }
+}
+
+fn review_rejected_rows(rejected_count: usize, findings: &mut Vec<KineticsReviewFinding>) {
+    if rejected_count > 0 {
+        findings.push(KineticsReviewFinding {
+            severity: KineticsReviewSeverity::Warning,
+            check_kind: KineticsReviewCheckKind::RejectedRowsVisible,
+            model_kind: None,
+            rejected_row_count: Some(rejected_count),
+            message: "rejected rows are present and remain visible",
+        });
+    }
+}
+
+fn review_status(findings: &[KineticsReviewFinding]) -> KineticsReviewStatus {
+    if findings
+        .iter()
+        .any(|finding| finding.severity == KineticsReviewSeverity::Error)
+    {
+        KineticsReviewStatus::Failed
+    } else if findings
+        .iter()
+        .any(|finding| finding.severity == KineticsReviewSeverity::Warning)
+    {
+        KineticsReviewStatus::PassedWithWarnings
+    } else {
+        KineticsReviewStatus::Passed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use deepseek_science_common::{DataColumn, DataTable};
 
     use crate::{
         KineticsColumns, KineticsComparisonBasis, KineticsError, KineticsFitResult,
-        KineticsModelComparison, KineticsModelKind, RejectedKineticsRowReason,
+        KineticsModelComparison, KineticsModelKind, KineticsReview, KineticsReviewCheckKind,
+        KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRowReason,
         ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
@@ -798,5 +973,192 @@ mod tests {
 
         assert_eq!(comparison.first_order.valid_point_count, 3);
         assert_eq!(comparison.second_order.valid_point_count, 3);
+    }
+
+    #[test]
+    fn reviewer_passes_for_clean_exact_first_order_like_comparison() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.5_f64).exp(), (-1.0_f64).exp(), (-1.5_f64).exp()],
+        );
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::Passed);
+        assert!(review.findings.is_empty());
+        assert!(review.checks_performed >= 5);
+    }
+
+    #[test]
+    fn reviewer_passes_for_clean_exact_second_order_like_comparison() {
+        let input = validated_input(&[0.0, 1.0, 2.0, 3.0], &[2.0, 1.0 / 0.75, 1.0, 1.0 / 1.25]);
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(comparison.preferred_model, KineticsModelKind::SecondOrder);
+        assert_eq!(review.status, KineticsReviewStatus::Passed);
+        assert!(review.findings.is_empty());
+    }
+
+    #[test]
+    fn reviewer_reports_finite_metrics_check() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let mut comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+        comparison.first_order.r_squared = f64::NAN;
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::Failed);
+        assert!(review.findings.iter().any(|finding| {
+            finding.severity == KineticsReviewSeverity::Error
+                && finding.check_kind == KineticsReviewCheckKind::FiniteMetrics
+                && finding.model_kind == Some(KineticsModelKind::FirstOrder)
+        }));
+    }
+
+    #[test]
+    fn reviewer_verifies_first_order_rate_constant_matches_negative_slope() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let mut comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+        comparison.first_order.rate_constant_k = comparison.first_order.slope;
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::Failed);
+        assert!(review.findings.iter().any(|finding| {
+            finding.severity == KineticsReviewSeverity::Error
+                && finding.check_kind == KineticsReviewCheckKind::RateConstantMatchesSlope
+                && finding.model_kind == Some(KineticsModelKind::FirstOrder)
+        }));
+    }
+
+    #[test]
+    fn reviewer_verifies_second_order_rate_constant_matches_slope() {
+        let input = validated_input(&[0.0, 1.0, 2.0], &[2.0, 1.0, 2.0 / 3.0]);
+        let mut comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+        comparison.second_order.rate_constant_k = -comparison.second_order.slope;
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::Failed);
+        assert!(review.findings.iter().any(|finding| {
+            finding.severity == KineticsReviewSeverity::Error
+                && finding.check_kind == KineticsReviewCheckKind::RateConstantMatchesSlope
+                && finding.model_kind == Some(KineticsModelKind::SecondOrder)
+        }));
+    }
+
+    #[test]
+    fn reviewer_reports_warning_when_rejected_rows_exist() {
+        let table = kinetics_table(
+            &[0.0, 99.0, 1.0, 2.0],
+            &[1.0, 0.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("two valid positive concentrations should remain");
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::PassedWithWarnings);
+        assert!(review.findings.iter().any(|finding| {
+            finding.severity == KineticsReviewSeverity::Warning
+                && finding.check_kind == KineticsReviewCheckKind::RejectedRowsVisible
+        }));
+    }
+
+    #[test]
+    fn reviewer_preserves_rejected_row_count_visibility() {
+        let table = kinetics_table(
+            &[0.0, 99.0, 1.0, 100.0, 2.0],
+            &[1.0, 0.0, (-0.25_f64).exp(), -1.0, (-0.5_f64).exp()],
+        );
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("three valid positive concentrations should remain");
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.rejected_row_count, 2);
+        assert!(review
+            .findings
+            .iter()
+            .any(|finding| finding.rejected_row_count == Some(2)));
+    }
+
+    #[test]
+    fn reviewer_status_becomes_passed_with_warnings_when_warnings_exist() {
+        let table = kinetics_table(&[0.0, 99.0, 1.0], &[1.0, 0.0, (-0.25_f64).exp()]);
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("two valid positive concentrations should remain");
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::PassedWithWarnings);
+    }
+
+    #[test]
+    fn reviewer_remains_deterministic_for_repeated_calls() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0, 3.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp(), (-0.75_f64).exp()],
+        );
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let first = KineticsReview::from_input_and_comparison(&input, &comparison);
+        let second = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn reviewer_uses_in_memory_data_without_side_effects() {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+        let comparison =
+            KineticsModelComparison::from_input(&input).expect("comparison should succeed");
+
+        let review = KineticsReview::from_input_and_comparison(&input, &comparison);
+
+        assert_eq!(review.status, KineticsReviewStatus::Passed);
+        assert_eq!(review.rejected_row_count, 0);
+    }
+
+    #[test]
+    fn reviewer_public_names_remain_non_definitive() {
+        let names = [
+            "KineticsReview",
+            "KineticsReviewStatus",
+            "KineticsReviewFinding",
+            "KineticsReviewCheckKind",
+        ];
+
+        for name in names {
+            assert!(!name.contains("True"));
+            assert!(!name.contains("Best"));
+            assert!(!name.contains("Final"));
+            assert!(!name.contains("Prove"));
+            assert!(!name.contains("Determine"));
+        }
     }
 }
