@@ -1,5 +1,6 @@
 //! In-memory input validation for chemistry kinetics workflows.
 
+use deepseek_science_artifacts::{hash_bytes, ArtifactKind, ProvenanceRecord, ReviewStatus};
 use deepseek_science_common::{
     simple_linear_regression, ColumnName, CommonError, DataColumn, DataTable,
 };
@@ -17,6 +18,10 @@ pub const CHEMISTRY_KINETICS_CSV_WORKFLOW_ID: &str = "chemistry.kinetics_csv";
 
 const MINIMUM_VALID_POINTS: usize = 2;
 const REVIEW_TOLERANCE: f64 = 1.0e-12;
+const KINETICS_ARTIFACT_TITLE: &str = "Chemistry kinetics analysis result";
+const KINETICS_ARTIFACT_PROVENANCE_NOTE: &str =
+    "workflow=chemistry.kinetics_csv;step=produce_analysis_result;source=DataTable";
+const KINETICS_ARTIFACT_CANONICAL_VERSION: &str = "deepseek-science.chemistry.kinetics.analysis.v1";
 
 /// Returns the deterministic generic workflow plan for `chemistry.kinetics_csv`.
 ///
@@ -357,6 +362,48 @@ impl KineticsAnalysisResult {
     }
 }
 
+/// In-memory artifact metadata proposal for a kinetics analysis result.
+///
+/// This is not a persisted artifact. It has no artifact id, filesystem path,
+/// storage path, timestamp, model output, or tool output. A future persistence
+/// boundary can convert this proposal into a generic artifact manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KineticsArtifactProposal {
+    /// Generic artifact kind for the structured deterministic result.
+    pub kind: ArtifactKind,
+    /// Human-readable title for future manifest conversion.
+    pub title: Option<String>,
+    /// Deterministic hash of canonical kinetics analysis content.
+    pub content_hash: String,
+    /// Input hashes known at this boundary. Empty until input table hashing is defined.
+    pub input_hashes: Vec<String>,
+    /// Path-free provenance metadata for future audit records.
+    pub provenance: Vec<ProvenanceRecord>,
+    /// Generic review status mapped from deterministic kinetics review.
+    pub review_status: ReviewStatus,
+}
+
+impl KineticsArtifactProposal {
+    /// Creates an in-memory artifact proposal from a deterministic analysis result.
+    ///
+    /// This computes a canonical content hash and generic metadata only. It
+    /// does not write files, persist storage, allocate an artifact id, call
+    /// models or tools, parse CSV, or execute workflows.
+    pub fn from_analysis_result(analysis: &KineticsAnalysisResult) -> Result<Self, KineticsError> {
+        let canonical = canonical_analysis_bytes(analysis)?;
+        let provenance = vec![ProvenanceRecord::new(KINETICS_ARTIFACT_PROVENANCE_NOTE)];
+
+        Ok(Self {
+            kind: ArtifactKind::Json,
+            title: Some(KINETICS_ARTIFACT_TITLE.to_string()),
+            content_hash: hash_bytes(&canonical),
+            input_hashes: Vec::new(),
+            provenance,
+            review_status: artifact_review_status(analysis.review_status()),
+        })
+    }
+}
+
 /// Exact caller-provided column names for kinetics input data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KineticsColumns {
@@ -553,6 +600,189 @@ fn comparison_metric(fit: KineticsFitResult) -> Result<f64, KineticsError> {
     Ok(fit.r_squared)
 }
 
+fn canonical_analysis_bytes(analysis: &KineticsAnalysisResult) -> Result<Vec<u8>, KineticsError> {
+    let mut bytes = Vec::new();
+
+    push_field(
+        &mut bytes,
+        "canonical_version",
+        KINETICS_ARTIFACT_CANONICAL_VERSION,
+    );
+    push_usize(&mut bytes, "valid_point_count", analysis.valid_point_count);
+    push_usize(
+        &mut bytes,
+        "rejected_row_count",
+        analysis.rejected_row_count,
+    );
+    push_fit(
+        &mut bytes,
+        analysis.comparison.first_order,
+        FitCanonicalFields {
+            model_kind: "first_order.model_kind",
+            slope: "first_order.slope",
+            intercept: "first_order.intercept",
+            rate_constant_k: "first_order.rate_constant_k",
+            r_squared: "first_order.r_squared",
+            valid_point_count: "first_order.valid_point_count",
+        },
+    )?;
+    push_fit(
+        &mut bytes,
+        analysis.comparison.second_order,
+        FitCanonicalFields {
+            model_kind: "second_order.model_kind",
+            slope: "second_order.slope",
+            intercept: "second_order.intercept",
+            rate_constant_k: "second_order.rate_constant_k",
+            r_squared: "second_order.r_squared",
+            valid_point_count: "second_order.valid_point_count",
+        },
+    )?;
+    push_field(
+        &mut bytes,
+        "preferred_model",
+        model_kind_label(analysis.preferred_model),
+    );
+    push_field(
+        &mut bytes,
+        "comparison_basis",
+        comparison_basis_label(analysis.comparison_basis),
+    );
+    push_field(
+        &mut bytes,
+        "review_status",
+        kinetics_review_status_label(analysis.review.status),
+    );
+    push_usize(
+        &mut bytes,
+        "review_finding_count",
+        analysis.review.findings.len(),
+    );
+
+    for (index, finding) in analysis.review.findings.iter().enumerate() {
+        push_usize(&mut bytes, "review_finding_index", index);
+        push_field(
+            &mut bytes,
+            "review_finding_severity",
+            review_severity_label(finding.severity),
+        );
+        push_field(
+            &mut bytes,
+            "review_finding_check_kind",
+            review_check_kind_label(finding.check_kind),
+        );
+        push_field(
+            &mut bytes,
+            "review_finding_model_kind",
+            optional_model_kind_label(finding.model_kind),
+        );
+        push_field(
+            &mut bytes,
+            "review_finding_rejected_row_count",
+            optional_usize_label(finding.rejected_row_count).as_str(),
+        );
+        push_field(&mut bytes, "review_finding_message", finding.message);
+    }
+
+    Ok(bytes)
+}
+
+struct FitCanonicalFields {
+    model_kind: &'static str,
+    slope: &'static str,
+    intercept: &'static str,
+    rate_constant_k: &'static str,
+    r_squared: &'static str,
+    valid_point_count: &'static str,
+}
+
+fn push_fit(
+    bytes: &mut Vec<u8>,
+    fit: KineticsFitResult,
+    fields: FitCanonicalFields,
+) -> Result<(), KineticsError> {
+    push_field(bytes, fields.model_kind, model_kind_label(fit.model_kind));
+    push_f64(bytes, fields.slope, fit.slope)?;
+    push_f64(bytes, fields.intercept, fit.intercept)?;
+    push_f64(bytes, fields.rate_constant_k, fit.rate_constant_k)?;
+    push_f64(bytes, fields.r_squared, fit.r_squared)?;
+    push_usize(bytes, fields.valid_point_count, fit.valid_point_count);
+    Ok(())
+}
+
+fn push_field(bytes: &mut Vec<u8>, name: &str, value: &str) {
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(b'=');
+    bytes.extend_from_slice(value.as_bytes());
+    bytes.push(b'\n');
+}
+
+fn push_usize(bytes: &mut Vec<u8>, name: &str, value: usize) {
+    push_field(bytes, name, value.to_string().as_str());
+}
+
+fn push_f64(bytes: &mut Vec<u8>, name: &'static str, value: f64) -> Result<(), KineticsError> {
+    if !value.is_finite() {
+        return Err(KineticsError::NonFiniteArtifactValue { field: name });
+    }
+
+    push_field(bytes, name, format!("{:016x}", value.to_bits()).as_str());
+    Ok(())
+}
+
+fn optional_usize_label(value: Option<usize>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn optional_model_kind_label(value: Option<KineticsModelKind>) -> &'static str {
+    value.map_or("none", model_kind_label)
+}
+
+fn artifact_review_status(status: KineticsReviewStatus) -> ReviewStatus {
+    match status {
+        KineticsReviewStatus::Passed => ReviewStatus::Passed,
+        KineticsReviewStatus::PassedWithWarnings => ReviewStatus::PassedWithWarnings,
+        KineticsReviewStatus::Failed => ReviewStatus::Failed,
+    }
+}
+
+fn model_kind_label(kind: KineticsModelKind) -> &'static str {
+    match kind {
+        KineticsModelKind::FirstOrder => "first_order",
+        KineticsModelKind::SecondOrder => "second_order",
+    }
+}
+
+fn comparison_basis_label(basis: KineticsComparisonBasis) -> &'static str {
+    match basis {
+        KineticsComparisonBasis::FiniteRSquaredMvpHeuristic => "finite_r_squared_mvp_heuristic",
+    }
+}
+
+fn kinetics_review_status_label(status: KineticsReviewStatus) -> &'static str {
+    match status {
+        KineticsReviewStatus::Passed => "passed",
+        KineticsReviewStatus::PassedWithWarnings => "passed_with_warnings",
+        KineticsReviewStatus::Failed => "failed",
+    }
+}
+
+fn review_severity_label(severity: KineticsReviewSeverity) -> &'static str {
+    match severity {
+        KineticsReviewSeverity::Warning => "warning",
+        KineticsReviewSeverity::Error => "error",
+    }
+}
+
+fn review_check_kind_label(kind: KineticsReviewCheckKind) -> &'static str {
+    match kind {
+        KineticsReviewCheckKind::RateConstantMatchesSlope => "rate_constant_matches_slope",
+        KineticsReviewCheckKind::FiniteMetrics => "finite_metrics",
+        KineticsReviewCheckKind::RejectedRowsVisible => "rejected_rows_visible",
+        KineticsReviewCheckKind::ComparisonBasisIsHeuristic => "comparison_basis_is_heuristic",
+    }
+}
+
 fn review_fit_metrics(fit: KineticsFitResult, findings: &mut Vec<KineticsReviewFinding>) {
     if [fit.slope, fit.intercept, fit.rate_constant_k, fit.r_squared]
         .iter()
@@ -639,6 +869,7 @@ fn workflow_step(
 
 #[cfg(test)]
 mod tests {
+    use deepseek_science_artifacts::{ArtifactKind, ReviewStatus};
     use deepseek_science_common::{DataColumn, DataTable};
     use deepseek_science_core::{
         AgentRun, CoreError, CoreEventEnvelope, RunId, RunInspection, RunState, ThreadId,
@@ -646,11 +877,11 @@ mod tests {
     };
 
     use crate::{
-        kinetics_csv_workflow_plan, KineticsAnalysisResult, KineticsColumns,
-        KineticsComparisonBasis, KineticsError, KineticsFitResult, KineticsModelComparison,
-        KineticsModelKind, KineticsReview, KineticsReviewCheckKind, KineticsReviewSeverity,
-        KineticsReviewStatus, RejectedKineticsRowReason, ValidatedKineticsInput,
-        CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+        kinetics_csv_workflow_plan, KineticsAnalysisResult, KineticsArtifactProposal,
+        KineticsColumns, KineticsComparisonBasis, KineticsError, KineticsFitResult,
+        KineticsModelComparison, KineticsModelKind, KineticsReview, KineticsReviewCheckKind,
+        KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRowReason,
+        ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -708,6 +939,23 @@ mod tests {
         let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
 
         AgentRun::prepare_from_plan(fixed_run_id(), fixed_thread_id(), &plan)
+    }
+
+    fn clean_analysis_result() -> KineticsAnalysisResult {
+        let input = validated_input(
+            &[0.0, 1.0, 2.0],
+            &[1.0, (-0.25_f64).exp(), (-0.5_f64).exp()],
+        );
+
+        KineticsAnalysisResult::analyze(&input).expect("analysis should succeed")
+    }
+
+    fn warning_analysis_result() -> KineticsAnalysisResult {
+        let table = kinetics_table(&[0.0, 99.0, 1.0], &[1.0, 0.0, (-0.25_f64).exp()]);
+        let input = ValidatedKineticsInput::from_table(&table, &kinetics_columns())
+            .expect("two valid positive concentrations should remain");
+
+        KineticsAnalysisResult::analyze(&input).expect("analysis should succeed")
     }
 
     fn assert_near(actual: f64, expected: f64) {
@@ -1638,5 +1886,116 @@ mod tests {
 
         assert_eq!(run.state(), RunState::Created);
         assert_eq!(run.steps().len(), expected_workflow_step_keys().len());
+    }
+
+    #[test]
+    fn artifact_proposal_can_be_created_from_valid_analysis_result() {
+        let analysis = clean_analysis_result();
+
+        let proposal = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("artifact proposal should construct");
+
+        assert_eq!(
+            proposal.title.as_deref(),
+            Some("Chemistry kinetics analysis result")
+        );
+        assert_eq!(proposal.content_hash.len(), 64);
+    }
+
+    #[test]
+    fn artifact_proposal_kind_is_generic_json() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        assert_eq!(proposal.kind, ArtifactKind::Json);
+    }
+
+    #[test]
+    fn artifact_content_hash_is_deterministic_for_repeated_identical_input() {
+        let analysis = clean_analysis_result();
+
+        let first = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("first artifact proposal should construct");
+        let second = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("second artifact proposal should construct");
+
+        assert_eq!(first.content_hash, second.content_hash);
+    }
+
+    #[test]
+    fn artifact_content_hash_changes_when_meaningful_analysis_value_changes() {
+        let analysis = clean_analysis_result();
+        let mut changed = analysis.clone();
+        changed.comparison.first_order.rate_constant_k += 0.001;
+
+        let first = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("first artifact proposal should construct");
+        let second = KineticsArtifactProposal::from_analysis_result(&changed)
+            .expect("changed artifact proposal should construct");
+
+        assert_ne!(first.content_hash, second.content_hash);
+    }
+
+    #[test]
+    fn artifact_content_hash_has_no_path_inputs() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        assert!(proposal.input_hashes.is_empty());
+        assert!(!proposal
+            .provenance
+            .iter()
+            .filter_map(|record| record.note.as_deref())
+            .any(|note| note.contains("/")));
+    }
+
+    #[test]
+    fn artifact_review_status_maps_passed() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        assert_eq!(proposal.review_status, ReviewStatus::Passed);
+    }
+
+    #[test]
+    fn artifact_review_status_maps_passed_with_warnings() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&warning_analysis_result())
+            .expect("artifact proposal should construct");
+
+        assert_eq!(proposal.review_status, ReviewStatus::PassedWithWarnings);
+    }
+
+    #[test]
+    fn artifact_review_status_maps_failed() {
+        let mut analysis = clean_analysis_result();
+        analysis.review.status = KineticsReviewStatus::Failed;
+
+        let proposal = KineticsArtifactProposal::from_analysis_result(&analysis)
+            .expect("artifact proposal should construct");
+
+        assert_eq!(proposal.review_status, ReviewStatus::Failed);
+    }
+
+    #[test]
+    fn artifact_provenance_omits_model_and_tool_call_ids_for_deterministic_mvp() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        assert_eq!(proposal.provenance.len(), 1);
+        assert_eq!(proposal.provenance[0].model_call_id, None);
+        assert_eq!(proposal.provenance[0].tool_call_id, None);
+        assert_eq!(proposal.provenance[0].prompt_prefix_hash, None);
+    }
+
+    #[test]
+    fn artifact_proposal_uses_in_memory_metadata_without_storage_or_file_io() {
+        let proposal = KineticsArtifactProposal::from_analysis_result(&clean_analysis_result())
+            .expect("artifact proposal should construct");
+
+        assert_eq!(proposal.kind, ArtifactKind::Json);
+        assert_eq!(
+            proposal.provenance[0].note.as_deref(),
+            Some("workflow=chemistry.kinetics_csv;step=produce_analysis_result;source=DataTable")
+        );
     }
 }

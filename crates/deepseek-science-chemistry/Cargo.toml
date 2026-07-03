@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+deepseek-science-artifacts = { path = "../deepseek-science-artifacts" }
 deepseek-science-common = { path = "../deepseek-science-common" }
 deepseek-science-core = { path = "../deepseek-science-core" }
 thiserror.workspace = true

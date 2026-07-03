@@ -75,6 +75,13 @@ pub enum KineticsError {
         model_kind: KineticsModelKind,
     },
 
+    /// Artifact mapping received a non-finite analysis value.
+    #[error("non-finite artifact mapping value: {field}")]
+    NonFiniteArtifactValue {
+        /// Canonical field being encoded.
+        field: &'static str,
+    },
+
     /// Error raised by shared in-memory table contracts.
     #[error(transparent)]
     Common(#[from] CommonError),
