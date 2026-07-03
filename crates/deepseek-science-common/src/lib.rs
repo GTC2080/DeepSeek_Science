@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 //! Small pure-Rust scientific utilities shared by future domain packs.
 //!
-//! This crate stays lightweight. It does not parse CSV, call external tools, or
-//! encode domain workflows in Phase 1.
+//! This crate stays lightweight. It contains small in-memory numeric helpers
+//! and table adapters, without calling external tools or encoding domain
+//! workflows.
 
+pub mod csv;
 pub mod error;
 pub mod fitting;
 pub mod statistics;
 pub mod table;
 pub mod units;
 
+pub use csv::parse_simple_numeric_csv;
 pub use error::CommonError;
 pub use fitting::{simple_linear_regression, LinearRegression};
 pub use statistics::mean;
