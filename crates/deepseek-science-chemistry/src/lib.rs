@@ -14,9 +14,9 @@ pub mod kinetics;
 
 pub use error::KineticsError;
 pub use kinetics::{
-    kinetics_csv_workflow_plan, KineticsAnalysisResult, KineticsColumns, KineticsComparisonBasis,
-    KineticsFitResult, KineticsModelComparison, KineticsModelKind, KineticsPoint, KineticsReview,
-    KineticsReviewCheckKind, KineticsReviewFinding, KineticsReviewSeverity, KineticsReviewStatus,
-    RejectedKineticsRow, RejectedKineticsRowReason, ValidatedKineticsInput,
-    CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+    kinetics_csv_workflow_plan, KineticsAnalysisResult, KineticsArtifactProposal, KineticsColumns,
+    KineticsComparisonBasis, KineticsFitResult, KineticsModelComparison, KineticsModelKind,
+    KineticsPoint, KineticsReview, KineticsReviewCheckKind, KineticsReviewFinding,
+    KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRow, RejectedKineticsRowReason,
+    ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
 };
