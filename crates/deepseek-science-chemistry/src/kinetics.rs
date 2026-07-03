@@ -640,7 +640,10 @@ fn workflow_step(
 #[cfg(test)]
 mod tests {
     use deepseek_science_common::{DataColumn, DataTable};
-    use deepseek_science_core::WorkflowStepKind;
+    use deepseek_science_core::{
+        AgentRun, CoreError, CoreEventEnvelope, RunId, RunInspection, RunState, ThreadId,
+        WorkflowStepKey, WorkflowStepKind,
+    };
 
     use crate::{
         kinetics_csv_workflow_plan, KineticsAnalysisResult, KineticsColumns,
@@ -666,10 +669,45 @@ mod tests {
         KineticsColumns::new("time", "concentration").expect("test columns should be valid")
     }
 
+    fn fixed_run_id() -> RunId {
+        RunId::from_uuid(
+            "00000000-0000-0000-0000-000000000101"
+                .parse()
+                .expect("test run id should parse"),
+        )
+    }
+
+    fn fixed_thread_id() -> ThreadId {
+        ThreadId::from_uuid(
+            "00000000-0000-0000-0000-000000000202"
+                .parse()
+                .expect("test thread id should parse"),
+        )
+    }
+
     fn validated_input(time: &[f64], concentration: &[f64]) -> ValidatedKineticsInput {
         let table = kinetics_table(time, concentration);
         ValidatedKineticsInput::from_table(&table, &kinetics_columns())
             .expect("test input should be valid")
+    }
+
+    fn expected_workflow_step_keys() -> Vec<&'static str> {
+        vec![
+            "inspect_input",
+            "validate_kinetics_input",
+            "fit_first_order",
+            "fit_second_order",
+            "compare_models",
+            "review_result",
+            "produce_analysis_result",
+            "complete",
+        ]
+    }
+
+    fn prepared_kinetics_run() -> AgentRun {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+
+        AgentRun::prepare_from_plan(fixed_run_id(), fixed_thread_id(), &plan)
     }
 
     fn assert_near(actual: f64, expected: f64) {
@@ -1453,19 +1491,7 @@ mod tests {
         let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
         let keys: Vec<_> = plan.step_keys().map(|key| key.as_str()).collect();
 
-        assert_eq!(
-            keys,
-            vec![
-                "inspect_input",
-                "validate_kinetics_input",
-                "fit_first_order",
-                "fit_second_order",
-                "compare_models",
-                "review_result",
-                "produce_analysis_result",
-                "complete",
-            ]
-        );
+        assert_eq!(keys, expected_workflow_step_keys());
     }
 
     #[test]
@@ -1529,5 +1555,88 @@ mod tests {
             assert!(!name.contains("call_model"));
             assert!(!name.contains("call_tool"));
         }
+    }
+
+    #[test]
+    fn kinetics_workflow_plan_prepares_core_run_skeleton() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+
+        let run = AgentRun::prepare_from_plan(fixed_run_id(), fixed_thread_id(), &plan);
+
+        assert_eq!(run.id(), fixed_run_id());
+        assert_eq!(run.thread_id(), fixed_thread_id());
+        assert_eq!(run.steps().len(), plan.step_count());
+    }
+
+    #[test]
+    fn prepared_kinetics_run_starts_in_created_state() {
+        let run = prepared_kinetics_run();
+
+        assert_eq!(run.state(), RunState::Created);
+    }
+
+    #[test]
+    fn prepared_run_step_count_matches_plan() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+        let run = AgentRun::prepare_from_plan(fixed_run_id(), fixed_thread_id(), &plan);
+
+        assert_eq!(run.steps().len(), plan.step_count());
+    }
+
+    #[test]
+    fn prepared_run_preserves_expected_workflow_step_key_order() {
+        let run = prepared_kinetics_run();
+        let keys: Vec<_> = run
+            .steps()
+            .iter()
+            .map(|step| step.workflow_step_key().map(WorkflowStepKey::as_str))
+            .collect();
+
+        assert_eq!(
+            keys,
+            expected_workflow_step_keys()
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prepared_steps_are_not_executed() {
+        let run = prepared_kinetics_run();
+
+        assert!(run
+            .steps()
+            .iter()
+            .all(|step| step.state() == RunState::Created));
+    }
+
+    #[test]
+    fn preparation_emits_no_events() {
+        let run = prepared_kinetics_run();
+        let events: [CoreEventEnvelope; 0] = [];
+
+        assert_eq!(
+            RunInspection::from_events(run.id(), &events),
+            Err(CoreError::MissingRunCreated { run_id: run.id() })
+        );
+    }
+
+    #[test]
+    fn repeated_preparation_with_same_inputs_is_deterministic() {
+        let plan = kinetics_csv_workflow_plan().expect("workflow plan should construct");
+
+        let first = AgentRun::prepare_from_plan(fixed_run_id(), fixed_thread_id(), &plan);
+        let second = AgentRun::prepare_from_plan(fixed_run_id(), fixed_thread_id(), &plan);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn preparation_does_not_require_data_table_or_runtime_resources() {
+        let run = prepared_kinetics_run();
+
+        assert_eq!(run.state(), RunState::Created);
+        assert_eq!(run.steps().len(), expected_workflow_step_keys().len());
     }
 }
