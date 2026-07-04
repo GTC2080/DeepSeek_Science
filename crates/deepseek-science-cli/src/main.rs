@@ -6,6 +6,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let output = deepseek_science_cli::run_cli(std::env::args());
     print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
 
     if output.exit_code == 0 {
         ExitCode::SUCCESS

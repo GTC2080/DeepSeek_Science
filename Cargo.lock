@@ -91,6 +91,7 @@ name = "deepseek-science-cli"
 version = "0.1.0"
 dependencies = [
  "deepseek-science-artifacts",
+ "deepseek-science-chemistry",
  "deepseek-science-common",
  "deepseek-science-core",
  "deepseek-science-model",
