@@ -58,7 +58,7 @@ vertical validation target, not a core assumption.
 | Sandbox policy interfaces | Present |
 | UI | Not implemented |
 | Real API calls | Not implemented |
-| Chemistry workflow | Not implemented |
+| Chemistry workflow | CLI MVP present for `chemistry.kinetics_csv` |
 
 ## Workspace
 
@@ -98,6 +98,57 @@ cargo run -p deepseek-science-cli -- doctor
 ```
 
 Crate-specific check and test aliases are defined in `.cargo/config.toml`.
+
+## Current CLI MVP
+
+The implemented v0.1 user-facing analysis command is:
+
+```sh
+deepseek-science kinetics analyze \
+  --input <path> \
+  --time-column <column> \
+  --concentration-column <column>
+```
+
+Example CSV input:
+
+```csv
+time_s,concentration_mol_l
+0,1
+1,0.5
+2,0.25
+3,0.125
+```
+
+Current CSV support is intentionally narrow: comma-separated UTF-8 text, one
+header row, numeric data rows only, and no quoted or multiline CSV fields. The
+caller must provide exact time and concentration column names; the CLI does not
+autodetect kinetics columns.
+
+The command reads one user-provided CSV file, parses it into an in-memory
+`DataTable`, validates the kinetics input, computes deterministic first-order
+and second-order linearized fits, compares them with the MVP finite
+`r_squared` heuristic, runs deterministic reviewer checks, and prints a plain
+text summary.
+
+The summary includes valid and rejected row counts, first-order and second-order
+`k` and `r_squared` values, the model preferred by MVP `r_squared` heuristic,
+and review status. This preference is not final scientific model selection.
+
+Current limitations:
+
+- No DeepSeek or other model calls.
+- No tool execution.
+- No CSV autodetection or full CSV dialect support.
+- No plotting.
+- No JSON output.
+- No artifact persistence.
+- No storage records or project workspace storage.
+- No UI.
+- No notebook, Jupyter, R, PubMed, or HPC integrations.
+
+Disk safety: the command reads exactly one input file, writes no output files,
+creates no storage records, and prints only to stdout/stderr.
 
 ## Phase 1 Boundaries
 
