@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 deepseek-science-artifacts = { path = "../deepseek-science-artifacts" }
+deepseek-science-chemistry = { path = "../deepseek-science-chemistry" }
 deepseek-science-common = { path = "../deepseek-science-common" }
 deepseek-science-core = { path = "../deepseek-science-core" }
 deepseek-science-model = { path = "../deepseek-science-model" }
