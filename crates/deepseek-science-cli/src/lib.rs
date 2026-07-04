@@ -262,7 +262,7 @@ second_order.k: {second_order_k:.6}
 second_order.r_squared: {second_order_r_squared:.6}
 preferred_model: {preferred_model}
 comparison_basis: {comparison_basis}
-preferred_note: Preferred by MVP r_squared heuristic; not definitive model selection.
+preferred_note: Preferred by MVP r_squared heuristic; not final scientific model selection.
 review_status: {review_status}
 review_findings: {review_finding_count}
 ",
@@ -560,7 +560,7 @@ mod tests {
         );
 
         assert!(output.contains("Preferred by MVP r_squared heuristic"));
-        assert!(!output.contains("definitive reaction order"));
+        assert!(!output.contains("definitive"));
         assert!(!output.contains("true model"));
         assert!(!output.contains("proved first-order"));
     }
