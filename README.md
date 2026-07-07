@@ -101,7 +101,7 @@ Crate-specific check and test aliases are defined in `.cargo/config.toml`.
 
 ## Current CLI MVP
 
-The implemented v0.1 user-facing analysis command is:
+The implemented user-facing analysis command is:
 
 ```sh
 deepseek-science kinetics analyze \
@@ -135,20 +135,91 @@ The summary includes valid and rejected row counts, first-order and second-order
 `k` and `r_squared` values, the model preferred by MVP `r_squared` heuristic,
 and review status. This preference is not final scientific model selection.
 
+Text output is the default. Successful text mode writes a human-readable summary
+to stdout, while errors write concise human-readable messages to stderr.
+
+Structured JSON output is also available for successful runs:
+
+```sh
+deepseek-science kinetics analyze \
+  --input crates/deepseek-science-cli/tests/fixtures/kinetics_success.csv \
+  --time-column time_s \
+  --concentration-column concentration_mol_l \
+  --json
+```
+
+`--json` changes only the successful output format. Successful JSON mode writes
+one JSON object to stdout, errors still write concise human-readable messages to
+stderr, and v0.2 does not define a JSON error schema. JSON stdout does not mix
+human prose or warnings outside the JSON object.
+
+Top-level JSON fields are:
+
+- `schema_version`
+- `command`
+- `input`
+- `columns`
+- `counts`
+- `fits`
+- `comparison`
+- `review`
+
+`schema_version` is `kinetics.analysis.v1`, and `command` is
+`kinetics.analyze`.
+
+Minimal JSON shape:
+
+```json
+{
+  "schema_version": "kinetics.analysis.v1",
+  "command": "kinetics.analyze",
+  "input": {
+    "path": "..."
+  },
+  "columns": {
+    "time": "time_s",
+    "concentration": "concentration_mol_l"
+  },
+  "counts": {
+    "valid_points": 4,
+    "rejected_rows": 0
+  },
+  "fits": {
+    "first_order": { "...": "..." },
+    "second_order": { "...": "..." }
+  },
+  "comparison": {
+    "basis": "finite_r_squared_mvp_heuristic",
+    "preferred_model": "first_order",
+    "caution": "preferred_by_mvp_r_squared_heuristic_not_final_scientific_model_selection"
+  },
+  "review": {
+    "status": "passed",
+    "findings": []
+  }
+}
+```
+
+The preferred model is preferred by the MVP finite `r_squared` heuristic and is
+not final scientific model selection.
+
 Current limitations:
 
 - No DeepSeek or other model calls.
+- No model-generated explanations.
 - No tool execution.
 - No CSV autodetection or full CSV dialect support.
 - No plotting.
-- No JSON output.
+- No JSON error schema.
+- No output file flag.
 - No artifact persistence.
 - No storage records or project workspace storage.
 - No UI.
 - No notebook, Jupyter, R, PubMed, or HPC integrations.
 
 Disk safety: the command reads exactly one input file, writes no output files,
-creates no storage records, and prints only to stdout/stderr.
+creates no storage records, creates no logs, caches, or temp directories, and
+prints only to stdout/stderr. JSON output goes to stdout only.
 
 ## Phase 1 Boundaries
 
