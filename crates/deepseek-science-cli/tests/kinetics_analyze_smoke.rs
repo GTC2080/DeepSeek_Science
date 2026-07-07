@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use serde_json::Value;
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -17,6 +19,21 @@ fn run_kinetics_analyze(fixture_name: &str) -> std::process::Output {
             "time_s",
             "--concentration-column",
             "concentration_mol_l",
+        ])
+        .output()
+        .expect("CLI process should run")
+}
+
+fn run_kinetics_analyze_json(fixture_name: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_deepseek-science"))
+        .args(["kinetics", "analyze", "--input"])
+        .arg(fixture_path(fixture_name))
+        .args([
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--json",
         ])
         .output()
         .expect("CLI process should run")
@@ -70,6 +87,47 @@ fn kinetics_analyze_process_succeeds_with_project_fixture() {
     assert!(!stdout.contains("true model"));
     assert!(!stdout.contains("proved"));
     assert!(!stdout.contains("proof"));
+}
+
+#[test]
+fn kinetics_analyze_process_json_success_outputs_deterministic_json() {
+    let fixture = fixture_path("kinetics_success.csv");
+    let (status, stdout, stderr) = output_text(run_kinetics_analyze_json("kinetics_success.csv"));
+
+    assert!(
+        status.success(),
+        "expected success, stderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    assert_eq!(stderr, "");
+
+    let value: Value = serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    let expected_input_path = fixture.to_string_lossy().to_string();
+
+    assert_eq!(value["schema_version"], "kinetics.analysis.v1");
+    assert_eq!(value["command"], "kinetics.analyze");
+    assert_eq!(value["input"]["path"], expected_input_path);
+    assert_eq!(value["columns"]["time"], "time_s");
+    assert_eq!(value["columns"]["concentration"], "concentration_mol_l");
+    assert!(value["counts"]["valid_points"].is_number());
+    assert!(value["counts"]["rejected_rows"].is_number());
+    assert!(value["fits"]["first_order"].is_object());
+    assert!(value["fits"]["second_order"].is_object());
+    assert_eq!(
+        value["comparison"]["basis"],
+        "finite_r_squared_mvp_heuristic"
+    );
+    assert!(value["comparison"]["caution"]
+        .as_str()
+        .expect("caution should be a string")
+        .contains("mvp_r_squared_heuristic"));
+    assert!(value["review"]["status"].is_string());
+
+    let lower_stdout = stdout.to_lowercase();
+    assert!(!lower_stdout.contains("definitive"));
+    assert!(!lower_stdout.contains("true model"));
+    assert!(!lower_stdout.contains("proved"));
+    assert!(!lower_stdout.contains("proof"));
+    assert!(!lower_stdout.contains("final reaction order"));
 }
 
 #[test]
