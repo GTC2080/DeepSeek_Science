@@ -39,6 +39,13 @@ fn run_kinetics_analyze_json(fixture_name: &str) -> std::process::Output {
         .expect("CLI process should run")
 }
 
+fn run_kinetics_analyze_help() -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_deepseek-science"))
+        .args(["kinetics", "analyze", "--help"])
+        .output()
+        .expect("CLI process should run")
+}
+
 fn output_text(output: std::process::Output) -> (std::process::ExitStatus, String, String) {
     let status = output.status;
     let stdout = String::from_utf8(output.stdout).expect("stdout should be UTF-8");
@@ -62,6 +69,22 @@ fn assert_user_error_without_success_summary(stdout: &str, stderr: &str) {
         !combined.contains("panic") && !combined.contains("backtrace"),
         "error output should not expose panic/backtrace wording: {combined}"
     );
+}
+
+#[test]
+fn kinetics_analyze_process_help_prints_usage_to_stdout() {
+    let (status, stdout, stderr) = output_text(run_kinetics_analyze_help());
+
+    assert!(
+        status.success(),
+        "expected help success, stderr:\n{stderr}\nstdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("--input <path>"));
+    assert!(stdout.contains("--time-column <column>"));
+    assert!(stdout.contains("--concentration-column <column>"));
+    assert!(stdout.contains("--json"));
+    assert_eq!(stderr, "");
 }
 
 #[test]
