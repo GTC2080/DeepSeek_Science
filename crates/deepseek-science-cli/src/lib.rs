@@ -57,6 +57,14 @@ impl CliOutput {
         }
     }
 
+    fn internal_error(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            stdout: String::new(),
+            stderr: format!("error: {}\n", message.into()),
+        }
+    }
+
     fn command_error(message: impl Into<String>) -> Self {
         Self {
             exit_code: 2,
@@ -71,11 +79,13 @@ struct KineticsAnalyzeArgs {
     input_path: String,
     time_column: String,
     concentration_column: String,
+    json_output: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CliError {
     User(String),
+    Internal(String),
 }
 
 /// Runs the CLI over an argument iterator including the binary name.
@@ -107,7 +117,7 @@ fn kinetics_usage() -> &'static str {
 }
 
 fn kinetics_analyze_usage() -> &'static str {
-    "Usage: deepseek-science kinetics analyze --input <path> --time-column <column> --concentration-column <column>\n"
+    "Usage: deepseek-science kinetics analyze --input <path> --time-column <column> --concentration-column <column> [--json]\n"
 }
 
 fn run_kinetics_command<I>(mut args: I) -> CliOutput
@@ -133,11 +143,13 @@ where
         Err(CliError::User(message)) => {
             return CliOutput::user_error_with_usage(message, kinetics_analyze_usage());
         }
+        Err(CliError::Internal(message)) => return CliOutput::internal_error(message),
     };
 
     match analyze_kinetics_csv(&args) {
         Ok(output) => CliOutput::success(output),
         Err(CliError::User(message)) => CliOutput::user_error(message),
+        Err(CliError::Internal(message)) => CliOutput::internal_error(message),
     }
 }
 
@@ -148,6 +160,7 @@ where
     let mut input_path = None;
     let mut time_column = None;
     let mut concentration_column = None;
+    let mut json_output = false;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -163,6 +176,9 @@ where
             "--concentration-column" => {
                 let value = next_option_value(&mut args, "--concentration-column")?;
                 set_required_arg(&mut concentration_column, "--concentration-column", value)?;
+            }
+            "--json" => {
+                set_flag(&mut json_output, "--json")?;
             }
             value if value.starts_with("--") => {
                 return Err(CliError::User(format!("unknown argument {value}")));
@@ -183,6 +199,7 @@ where
         concentration_column: concentration_column.ok_or_else(|| {
             CliError::User("missing required argument --concentration-column".to_string())
         })?,
+        json_output,
     })
 }
 
@@ -214,6 +231,15 @@ fn set_required_arg(
     Ok(())
 }
 
+fn set_flag(target: &mut bool, option_name: &str) -> Result<(), CliError> {
+    if *target {
+        return Err(CliError::User(format!("duplicate argument {option_name}")));
+    }
+
+    *target = true;
+    Ok(())
+}
+
 fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> {
     let csv_text = fs::read_to_string(&args.input_path).map_err(|error| {
         CliError::User(format!(
@@ -229,12 +255,21 @@ fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> 
         ValidatedKineticsInput::from_table(&table, &columns).map_err(format_kinetics_error)?;
     let analysis = KineticsAnalysisResult::analyze(&input).map_err(format_kinetics_error)?;
 
-    Ok(format_kinetics_analysis_output(
-        &args.input_path,
-        &args.time_column,
-        &args.concentration_column,
-        &analysis,
-    ))
+    if args.json_output {
+        format_kinetics_analysis_json_output(
+            &args.input_path,
+            &args.time_column,
+            &args.concentration_column,
+            &analysis,
+        )
+    } else {
+        Ok(format_kinetics_analysis_output(
+            &args.input_path,
+            &args.time_column,
+            &args.concentration_column,
+            &analysis,
+        ))
+    }
 }
 
 fn format_kinetics_error(error: KineticsError) -> CliError {
@@ -292,6 +327,89 @@ review_findings: {review_finding_count}
     }
 
     output
+}
+
+fn format_kinetics_analysis_json_output(
+    input_path: &str,
+    time_column: &str,
+    concentration_column: &str,
+    analysis: &KineticsAnalysisResult,
+) -> Result<String, CliError> {
+    let first_order = analysis.comparison.first_order;
+    let second_order = analysis.comparison.second_order;
+    let review_findings = analysis
+        .review
+        .findings
+        .iter()
+        .map(review_finding_json)
+        .collect::<Vec<_>>();
+    let value = serde_json::json!({
+        "schema_version": "kinetics.analysis.v1",
+        "command": "kinetics.analyze",
+        "input": {
+            "path": input_path,
+        },
+        "columns": {
+            "time": time_column,
+            "concentration": concentration_column,
+        },
+        "counts": {
+            "valid_points": analysis.valid_point_count(),
+            "rejected_rows": analysis.rejected_row_count(),
+        },
+        "fits": {
+            "first_order": fit_json(first_order)?,
+            "second_order": fit_json(second_order)?,
+        },
+        "comparison": {
+            "basis": comparison_basis_label(analysis.comparison_basis()),
+            "preferred_model": model_kind_label(analysis.preferred_model()),
+            "caution": "preferred_by_mvp_r_squared_heuristic_not_final_scientific_model_selection",
+        },
+        "review": {
+            "status": review_status_label(analysis.review_status()),
+            "findings": review_findings,
+        },
+    });
+    let mut output = serde_json::to_string(&value)
+        .map_err(|error| CliError::Internal(format!("could not format JSON output: {error}")))?;
+    output.push('\n');
+
+    Ok(output)
+}
+
+fn fit_json(
+    fit: deepseek_science_chemistry::KineticsFitResult,
+) -> Result<serde_json::Value, CliError> {
+    Ok(serde_json::json!({
+        "k": finite_json_float(fit.rate_constant_k, "fit.k")?,
+        "slope": finite_json_float(fit.slope, "fit.slope")?,
+        "intercept": finite_json_float(fit.intercept, "fit.intercept")?,
+        "r_squared": finite_json_float(fit.r_squared, "fit.r_squared")?,
+        "valid_point_count": fit.valid_point_count,
+    }))
+}
+
+fn review_finding_json(
+    finding: &deepseek_science_chemistry::KineticsReviewFinding,
+) -> serde_json::Value {
+    serde_json::json!({
+        "severity": review_severity_label(finding.severity),
+        "check": review_check_kind_label(finding.check_kind),
+        "model": finding.model_kind.map(model_kind_label),
+        "rejected_row_count": finding.rejected_row_count,
+        "message": finding.message,
+    })
+}
+
+fn finite_json_float(value: f64, field: &'static str) -> Result<f64, CliError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(CliError::Internal(format!(
+            "non-finite JSON output value: {field}"
+        )))
+    }
 }
 
 fn model_kind_label(kind: KineticsModelKind) -> &'static str {
@@ -489,7 +607,25 @@ mod tests {
     }
 
     #[test]
-    fn kinetics_analyze_arg_parser_rejects_unknown_argument() {
+    fn kinetics_analyze_arg_parser_accepts_json_flag() {
+        let args = parse_args(&[
+            "--input",
+            "kinetics.csv",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--json",
+        ])
+        .expect("valid args with --json should parse");
+
+        assert_eq!(args.input_path, "kinetics.csv");
+        assert_eq!(args.time_column, "time_s");
+        assert_eq!(args.concentration_column, "concentration_mol_l");
+    }
+
+    #[test]
+    fn kinetics_analyze_arg_parser_rejects_duplicate_json_flag() {
         let result = parse_args(&[
             "--input",
             "kinetics.csv",
@@ -498,11 +634,30 @@ mod tests {
             "--concentration-column",
             "concentration_mol_l",
             "--json",
+            "--json",
         ]);
 
         assert_eq!(
             result,
-            Err(CliError::User("unknown argument --json".to_string()))
+            Err(CliError::User("duplicate argument --json".to_string()))
+        );
+    }
+
+    #[test]
+    fn kinetics_analyze_arg_parser_rejects_unknown_argument() {
+        let result = parse_args(&[
+            "--input",
+            "kinetics.csv",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--wat",
+        ]);
+
+        assert_eq!(
+            result,
+            Err(CliError::User("unknown argument --wat".to_string()))
         );
     }
 

@@ -20,6 +20,7 @@ deepseek-science-prompt = { path = "../deepseek-science-prompt" }
 deepseek-science-sandbox = { path = "../deepseek-science-sandbox" }
 deepseek-science-storage = { path = "../deepseek-science-storage" }
 deepseek-science-tools = { path = "../deepseek-science-tools" }
+serde_json.workspace = true
 
 [lints]
 workspace = true
