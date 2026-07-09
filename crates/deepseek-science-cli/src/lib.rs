@@ -117,7 +117,22 @@ fn kinetics_usage() -> &'static str {
 }
 
 fn kinetics_analyze_usage() -> &'static str {
-    "Usage: deepseek-science kinetics analyze --input <path> --time-column <column> --concentration-column <column> [--json]\n"
+    "\
+Usage:
+  deepseek-science kinetics analyze --input <path> --time-column <column> --concentration-column <column> [--json]
+
+Options:
+  --input <path>                    Path to a simple numeric CSV file
+  --time-column <column>            Time column name
+  --concentration-column <column>   Concentration column name
+  --json                            Write successful analysis as JSON to stdout
+  -h, --help                        Show this help
+
+Notes:
+  Text output is the default.
+  Errors are written to stderr.
+  JSON mode does not change error output.
+"
 }
 
 fn run_kinetics_command<I>(mut args: I) -> CliOutput
@@ -138,6 +153,11 @@ fn run_kinetics_analyze<I>(args: I) -> CliOutput
 where
     I: IntoIterator<Item = String>,
 {
+    let args = args.into_iter().collect::<Vec<_>>();
+    if is_kinetics_analyze_help(&args) {
+        return CliOutput::success(kinetics_analyze_usage().to_string());
+    }
+
     let args = match parse_kinetics_analyze_args(args) {
         Ok(args) => args,
         Err(CliError::User(message)) => {
@@ -151,6 +171,10 @@ where
         Err(CliError::User(message)) => CliOutput::user_error(message),
         Err(CliError::Internal(message)) => CliOutput::internal_error(message),
     }
+}
+
+fn is_kinetics_analyze_help(args: &[String]) -> bool {
+    matches!(args, [flag] if flag == "--help" || flag == "-h")
 }
 
 fn parse_kinetics_analyze_args<I>(args: I) -> Result<KineticsAnalyzeArgs, CliError>
@@ -625,6 +649,30 @@ mod tests {
     }
 
     #[test]
+    fn kinetics_analyze_help_prints_usage_without_error() {
+        let output = run_cli(["deepseek-science", "kinetics", "analyze", "--help"]);
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Usage:"));
+        assert!(output.stdout.contains("--input <path>"));
+        assert!(output.stdout.contains("--time-column <column>"));
+        assert!(output.stdout.contains("--concentration-column <column>"));
+        assert!(output.stdout.contains("--json"));
+        assert!(output.stdout.contains("Text output is the default."));
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn kinetics_analyze_short_help_prints_usage_without_error() {
+        let output = run_cli(["deepseek-science", "kinetics", "analyze", "-h"]);
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("Usage:"));
+        assert!(output.stdout.contains("--json"));
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
     fn kinetics_analyze_arg_parser_rejects_duplicate_json_flag() {
         let result = parse_args(&[
             "--input",
@@ -678,6 +726,45 @@ mod tests {
             result,
             Err(CliError::User("duplicate argument --input".to_string()))
         );
+    }
+
+    #[test]
+    fn kinetics_analyze_unknown_argument_reports_useful_error() {
+        let output = run_cli([
+            "deepseek-science",
+            "kinetics",
+            "analyze",
+            "--input",
+            "kinetics.csv",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--wat",
+        ]);
+
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stderr.contains("unknown argument --wat"));
+        assert!(output.stderr.contains("Usage:"));
+        assert_eq!(output.stdout, "");
+    }
+
+    #[test]
+    fn kinetics_analyze_missing_required_argument_reports_useful_error() {
+        let output = run_cli([
+            "deepseek-science",
+            "kinetics",
+            "analyze",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+        ]);
+
+        assert_eq!(output.exit_code, 1);
+        assert!(output.stderr.contains("missing required argument --input"));
+        assert!(output.stderr.contains("Usage:"));
+        assert_eq!(output.stdout, "");
     }
 
     #[test]
