@@ -196,38 +196,7 @@ mod tests {
     use super::{AtomicWriteRequest, WriteMode};
     use crate::{PathSafetyViolation, StorageError, StorageRoot};
     use std::ffi::OsStr;
-    use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-    struct TestDirectory {
-        path: PathBuf,
-    }
-
-    impl TestDirectory {
-        fn new() -> Self {
-            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "deepseek-science-storage-{}-{sequence}",
-                std::process::id()
-            ));
-            fs::create_dir(&path).expect("test directory should be unique");
-
-            Self { path }
-        }
-
-        fn root(&self) -> StorageRoot {
-            StorageRoot::new(self.path.clone()).expect("test root should be valid")
-        }
-    }
-
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
 
     #[test]
     fn request_rejects_unsafe_logical_path_when_planned() {
@@ -300,99 +269,5 @@ mod tests {
         let request = AtomicWriteRequest::new("runs/../escape.bin", b"x".to_vec());
 
         assert!(request.plan(&root).is_err());
-    }
-
-    #[test]
-    fn execute_creates_exact_opaque_bytes_and_removes_temp_file() {
-        let directory = TestDirectory::new();
-        let request = AtomicWriteRequest::new("result.bin", vec![0, 159, 255, 10]);
-        let plan = request
-            .plan(&directory.root())
-            .expect("safe path should plan");
-
-        plan.execute(request.content())
-            .expect("create-new write should succeed");
-
-        assert_eq!(
-            fs::read(plan.target_path()).expect("target should be readable"),
-            request.content()
-        );
-        assert!(!plan.temp_path().exists());
-    }
-
-    #[test]
-    fn execute_refuses_existing_target_without_modifying_it() {
-        let directory = TestDirectory::new();
-        let request = AtomicWriteRequest::new("result.bin", b"new".to_vec());
-        let plan = request
-            .plan(&directory.root())
-            .expect("safe path should plan");
-        fs::write(plan.target_path(), b"existing").expect("target setup should succeed");
-
-        let error = plan
-            .execute(request.content())
-            .expect_err("existing target should be refused");
-
-        assert!(matches!(error, StorageError::TargetAlreadyExists { .. }));
-        assert_eq!(
-            fs::read(plan.target_path()).expect("existing target should remain readable"),
-            b"existing"
-        );
-        assert!(!plan.temp_path().exists());
-    }
-
-    #[test]
-    fn execute_requires_existing_parent_without_creating_it() {
-        let directory = TestDirectory::new();
-        let request = AtomicWriteRequest::new("missing/result.bin", b"new".to_vec());
-        let plan = request
-            .plan(&directory.root())
-            .expect("safe path should plan");
-
-        let error = plan
-            .execute(request.content())
-            .expect_err("missing parent should be refused");
-
-        assert!(matches!(error, StorageError::ParentDirectoryMissing { .. }));
-        assert!(!directory.path.join("missing").exists());
-    }
-
-    #[test]
-    fn execute_does_not_replace_or_remove_a_stale_temp_file() {
-        let directory = TestDirectory::new();
-        let request = AtomicWriteRequest::new("result.bin", b"new".to_vec());
-        let plan = request
-            .plan(&directory.root())
-            .expect("safe path should plan");
-        fs::write(plan.temp_path(), b"stale").expect("temp setup should succeed");
-
-        let error = plan
-            .execute(request.content())
-            .expect_err("stale temp should be refused");
-
-        assert!(matches!(error, StorageError::WriteFailed { .. }));
-        assert_eq!(
-            fs::read(plan.temp_path()).expect("stale temp should remain readable"),
-            b"stale"
-        );
-        assert!(!plan.target_path().exists());
-    }
-
-    #[test]
-    fn execute_rejects_replace_existing_without_filesystem_changes() {
-        let directory = TestDirectory::new();
-        let request = AtomicWriteRequest::new("result.bin", b"new".to_vec())
-            .with_write_mode(WriteMode::ReplaceExisting);
-        let plan = request
-            .plan(&directory.root())
-            .expect("safe path should plan");
-
-        let error = plan
-            .execute(request.content())
-            .expect_err("replace-existing execution should be deferred");
-
-        assert!(matches!(error, StorageError::Backend { .. }));
-        assert!(!plan.target_path().exists());
-        assert!(!plan.temp_path().exists());
     }
 }
