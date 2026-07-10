@@ -6,6 +6,7 @@
 //! workflows.
 
 pub mod csv;
+pub mod encoding;
 pub mod error;
 pub mod fitting;
 pub mod statistics;
@@ -13,6 +14,10 @@ pub mod table;
 pub mod units;
 
 pub use csv::parse_simple_numeric_csv;
+pub use encoding::{
+    inspect_text_encoding, ByteOrderMark, EncodingInspection, EncodingInspectionError,
+    TextEncoding, MAX_INSPECTION_BYTES,
+};
 pub use error::CommonError;
 pub use fitting::{simple_linear_regression, LinearRegression};
 pub use statistics::mean;
