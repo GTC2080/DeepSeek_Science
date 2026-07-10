@@ -34,7 +34,7 @@ pub enum WriteRequestViolation {
     MissingTargetFileName,
 }
 
-/// Errors surfaced by future storage implementations.
+/// Errors surfaced by storage operations.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum StorageError {
     /// The storage root path is invalid before any filesystem access occurs.
@@ -83,8 +83,8 @@ pub enum StorageError {
         /// Failure reason with sensitive data already removed.
         reason: String,
     },
-    /// Renaming a temporary sibling into the final target failed.
-    #[error("rename failed from {from:?} to {to:?}: {reason}")]
+    /// Committing a temporary sibling into the final target failed.
+    #[error("commit failed from {from:?} to {to:?}: {reason}")]
     RenameFailed {
         /// Temporary path that was written first.
         from: PathBuf,
