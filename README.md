@@ -117,7 +117,33 @@ kinetics-workflow compatibility.
 
 Structural incompatibility is reported without repairing or rewriting the
 input. Inspection does not select chemistry columns, run kinetics analysis,
-create project state, or write files. Data conversion is not implemented yet.
+create project state, or write files.
+
+### Explicit laboratory text conversion
+
+Normalize one eligible inspected table into one new simple CSV file:
+
+```sh
+deepseek-science data convert \
+  --input <path> \
+  --output <path>
+```
+
+Conversion is explicit and deliberately narrow. It supports UTF-8 with a BOM,
+BOM-marked UTF-16LE/BE, and tab-delimited named finite numeric narrow tables.
+Output is deterministic UTF-8 without a BOM, comma-delimited, LF-only, and has
+exactly one trailing newline. Exact safe header and numeric cell text is
+preserved; numeric values are not reformatted.
+
+Input is limited to 16 MiB and normalized output to 24 MiB. The output parent
+must already exist, and an existing target is never overwritten. Input already
+compatible with the current UTF-8 comma parser is rejected because it can be
+used directly.
+
+Conversion refuses matrices, metadata preambles, unit rows, blank rows, quoted
+or multiline fields, ambiguous structure, cells requiring whitespace repair,
+and content requiring CSV quoting. It does not infer columns, run kinetics,
+call a model, create project state, or provide JSON output.
 
 ### Kinetics analysis
 
@@ -246,7 +272,8 @@ Current limitations:
 - No model-generated explanations.
 - No model-based encoding, delimiter, table, or chemistry detection.
 - No tool execution.
-- No data conversion or automatic normalization.
+- Data conversion is limited to the explicit narrow BOM/UTF-16/tab contract.
+- No metadata removal, unit-row removal, whitespace repair, or matrix conversion.
 - No full CSV dialect support, quoted fields, or multiline fields.
 - No semicolon delimiter or locale-dependent number detection.
 - No Excel or proprietary binary instrument formats.
@@ -265,7 +292,9 @@ nothing. For `kinetics analyze`, omitting `--output` also writes no files.
 Explicit analysis `--output` may create one bounded sibling temporary file
 while atomically publishing one JSON target. These commands create no parent
 directories, storage records, logs, caches, artifacts, run records, or project
-workspace state.
+workspace state. Explicit `data convert --output` likewise uses atomic
+create-new publication for one target, never overwrites, and never creates its
+parent directory.
 
 ## Phase 1 Boundaries
 

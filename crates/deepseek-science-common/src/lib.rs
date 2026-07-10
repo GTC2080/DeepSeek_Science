@@ -10,6 +10,7 @@ pub mod delimited;
 pub mod encoding;
 pub mod error;
 pub mod fitting;
+pub mod normalize;
 pub mod statistics;
 pub mod table;
 pub mod units;
@@ -26,6 +27,9 @@ pub use encoding::{
 };
 pub use error::CommonError;
 pub use fitting::{simple_linear_regression, LinearRegression};
+pub use normalize::{
+    normalize_delimited_text, NormalizationError, UnsafeCellReason, MAX_NORMALIZED_OUTPUT_BYTES,
+};
 pub use statistics::mean;
 pub use table::{ColumnName, DataColumn, DataTable, TableShape};
 pub use units::Unit;

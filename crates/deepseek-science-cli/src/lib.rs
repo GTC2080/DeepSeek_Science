@@ -16,17 +16,19 @@ use deepseek_science_chemistry::{
 };
 use deepseek_science_common::{
     assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, mean,
-    parse_simple_numeric_csv, BoundedLineEvidence, ByteOrderMark, DelimitedInspectionError,
-    DelimitedTextInspection, DelimiterFinding, EncodingInspection, EncodingInspectionError,
-    GenericTableShape, SimpleCsvCompatibility, TableShapeReason, TextEncoding,
-    MAX_INSPECTION_BYTES,
+    normalize_delimited_text, parse_simple_numeric_csv, BoundedLineEvidence, ByteOrderMark,
+    DelimitedInspectionError, DelimitedTextInspection, DelimiterFinding, EncodingInspection,
+    EncodingInspectionError, GenericTableShape, NormalizationError, SimpleCsvCompatibility,
+    TableShapeReason, TextEncoding, MAX_INSPECTION_BYTES, MAX_NORMALIZED_OUTPUT_BYTES,
 };
 use deepseek_science_core::ProjectId;
 use deepseek_science_model::ModelCapabilities;
 use deepseek_science_model_deepseek::DeepSeekModel;
 use deepseek_science_prompt::PromptVersionInfo;
 use deepseek_science_sandbox::SandboxPolicy;
-use deepseek_science_storage::{AtomicWriteRequest, StorageLayout, StorageRoot, WriteMode};
+use deepseek_science_storage::{
+    AtomicWritePlan, AtomicWriteRequest, StorageError, StorageLayout, StorageRoot, WriteMode,
+};
 use deepseek_science_tools::ToolRegistry;
 
 /// CLI command output and process status.
@@ -96,6 +98,12 @@ struct DataInspectArgs {
     input_path: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DataConvertArgs {
+    input_path: String,
+    output_path: String,
+}
+
 #[derive(Debug)]
 enum BoundedReadError {
     Io(io::Error),
@@ -138,16 +146,18 @@ Usage: deepseek-science <doctor|version|help|kinetics|data>
 
 Commands:
   data inspect   Inspect one laboratory text file without modifying it
+  data convert   Normalize one eligible laboratory text table into a new CSV
 "
     .to_owned()
 }
 
 fn data_usage() -> &'static str {
     "\
-Usage: deepseek-science data <inspect>
+Usage: deepseek-science data <inspect|convert>
 
 Commands:
   inspect   Inspect one explicit laboratory text file without writing files
+  convert   Normalize one eligible table into one new simple CSV file
 "
 }
 
@@ -167,6 +177,26 @@ Limits and behavior:
   The command writes no files or hidden state.
   It does not modify, normalize, convert, or analyze the input.
   Incompatible table structure is reported rather than repaired.
+"
+}
+
+fn data_convert_usage() -> &'static str {
+    "\
+Usage:
+  deepseek-science data convert --input <path> --output <path>
+
+Options:
+  --input <path>    Path to one regular laboratory text file
+  --output <path>   New simple CSV target; existing files are never overwritten
+  -h, --help        Show this help
+
+Limits and behavior:
+  Input is limited to 16 MiB; normalized output is limited to 24 MiB.
+  Eligible UTF-8 BOM, BOM-marked UTF-16LE/BE, and tab tables are normalized.
+  Output is UTF-8 without BOM, comma-delimited, LF-only, with exactly one final LF.
+  The output parent must already exist, and already-compatible input is rejected.
+  Matrices, metadata, unit rows, blank rows, quotes, and whitespace repair are rejected.
+  No scientific columns are inferred, no kinetics analysis runs, and no JSON mode exists.
 "
 }
 
@@ -205,11 +235,38 @@ where
         [subcommand, remaining @ ..] if subcommand == "inspect" => {
             run_data_inspect(remaining.iter().cloned())
         }
+        [subcommand, remaining @ ..] if subcommand == "convert" => {
+            run_data_convert(remaining.iter().cloned())
+        }
         [command, ..] => CliOutput::user_error_with_usage(
             format!("unknown data subcommand: {command}"),
             data_usage(),
         ),
         [] => CliOutput::user_error_with_usage("missing data subcommand", data_usage()),
+    }
+}
+
+fn run_data_convert<I>(args: I) -> CliOutput
+where
+    I: IntoIterator<Item = String>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
+        return CliOutput::success(data_convert_usage().to_string());
+    }
+
+    let args = match parse_data_convert_args(args) {
+        Ok(args) => args,
+        Err(CliError::User(message)) => {
+            return CliOutput::user_error_with_usage(message, data_convert_usage());
+        }
+        Err(CliError::Internal(message)) => return CliOutput::internal_error(message),
+    };
+
+    match convert_data_file(&args) {
+        Ok(output) => CliOutput::success(output),
+        Err(CliError::User(message)) => CliOutput::user_error(message),
+        Err(CliError::Internal(message)) => CliOutput::internal_error(message),
     }
 }
 
@@ -264,6 +321,43 @@ where
     Ok(DataInspectArgs {
         input_path: input_path
             .ok_or_else(|| CliError::User("missing required argument --input".to_string()))?,
+    })
+}
+
+fn parse_data_convert_args<I>(args: I) -> Result<DataConvertArgs, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut input_path = None;
+    let mut output_path = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--input" => {
+                let value = next_data_option_value(&mut args, "--input")?;
+                set_required_arg(&mut input_path, "--input", value)?;
+            }
+            "--output" => {
+                let value = next_data_option_value(&mut args, "--output")?;
+                set_required_arg(&mut output_path, "--output", value)?;
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::User(format!("unknown argument {value}")));
+            }
+            value => {
+                return Err(CliError::User(format!(
+                    "unexpected positional argument {value}"
+                )));
+            }
+        }
+    }
+
+    Ok(DataConvertArgs {
+        input_path: input_path
+            .ok_or_else(|| CliError::User("missing required argument --input".to_string()))?,
+        output_path: output_path
+            .ok_or_else(|| CliError::User("missing required argument --output".to_string()))?,
     })
 }
 
@@ -418,6 +512,51 @@ fn set_flag(target: &mut bool, option_name: &str) -> Result<(), CliError> {
 }
 
 fn inspect_data_file(input_path: &str) -> Result<String, CliError> {
+    let bytes = read_inspection_input(input_path)?;
+    let encoding = inspect_text_encoding(&bytes).map_err(format_encoding_inspection_error)?;
+    let table =
+        inspect_delimited_text(&encoding.text).map_err(format_delimited_inspection_error)?;
+    let compatibility = assess_simple_csv_compatibility(&encoding, &table);
+
+    Ok(format_data_inspection_report(
+        &encoding,
+        &table,
+        compatibility,
+    ))
+}
+
+fn convert_data_file(args: &DataConvertArgs) -> Result<String, CliError> {
+    if paths_are_lexically_equal(&args.input_path, &args.output_path) {
+        return Err(CliError::User(
+            "input and output paths must be different".to_string(),
+        ));
+    }
+
+    let bytes = read_inspection_input(&args.input_path)?;
+    let encoding = inspect_text_encoding(&bytes).map_err(format_encoding_inspection_error)?;
+    let table =
+        inspect_delimited_text(&encoding.text).map_err(format_delimited_inspection_error)?;
+    let normalized =
+        normalize_delimited_text(&encoding, &table).map_err(format_normalization_error)?;
+
+    parse_simple_numeric_csv(&normalized).map_err(|_| {
+        CliError::Internal("normalized output failed simple CSV validation".to_string())
+    })?;
+    if normalized.len() > MAX_NORMALIZED_OUTPUT_BYTES {
+        return Err(CliError::Internal(
+            "normalized output exceeded its validated size limit".to_string(),
+        ));
+    }
+
+    write_converted_output_file(&args.output_path, normalized.as_bytes())?;
+    format_data_conversion_report(&encoding, &table, normalized.len())
+}
+
+fn paths_are_lexically_equal(input_path: &str, output_path: &str) -> bool {
+    Path::new(input_path) == Path::new(output_path)
+}
+
+fn read_inspection_input(input_path: &str) -> Result<Vec<u8>, CliError> {
     let file = fs::File::open(input_path).map_err(|error| {
         CliError::User(format!("could not open input file `{input_path}`: {error}"))
     })?;
@@ -450,16 +589,8 @@ fn inspect_data_file(input_path: &str) -> Result<String, CliError> {
             )));
         }
     };
-    let encoding = inspect_text_encoding(&bytes).map_err(format_encoding_inspection_error)?;
-    let table =
-        inspect_delimited_text(&encoding.text).map_err(format_delimited_inspection_error)?;
-    let compatibility = assess_simple_csv_compatibility(&encoding, &table);
 
-    Ok(format_data_inspection_report(
-        &encoding,
-        &table,
-        compatibility,
-    ))
+    Ok(bytes)
 }
 
 fn read_bounded<R: Read>(reader: R, maximum: usize) -> Result<Vec<u8>, BoundedReadError> {
@@ -506,6 +637,51 @@ fn format_delimited_inspection_error(error: DelimitedInspectionError) -> CliErro
             ),
         ),
     }
+}
+
+fn format_normalization_error(error: NormalizationError) -> CliError {
+    match error {
+        NormalizationError::AlreadyCompatible
+        | NormalizationError::StructuralConversionIneligible
+        | NormalizationError::UnsafeCellContent { .. }
+        | NormalizationError::OutputLimitExceeded { .. } => CliError::User(error.to_string()),
+        NormalizationError::ArithmeticOverflow | NormalizationError::InspectionInvariant => {
+            CliError::Internal(error.to_string())
+        }
+    }
+}
+
+fn format_data_conversion_report(
+    encoding: &EncodingInspection,
+    table: &DelimitedTextInspection,
+    output_bytes: usize,
+) -> Result<String, CliError> {
+    let region = table.region.as_ref().ok_or_else(|| {
+        CliError::Internal("conversion table region was not available".to_string())
+    })?;
+
+    Ok(format!(
+        "\
+conversion_status: complete
+source_encoding: {source_encoding}
+source_bom: {source_bom}
+source_delimiter: {source_delimiter}
+output_encoding: utf-8
+output_bom: none
+output_delimiter: comma
+line_endings: lf
+field_count: {field_count}
+data_rows: {data_rows}
+input_bytes: {input_bytes}
+output_bytes: {output_bytes}
+",
+        source_encoding = text_encoding_label(encoding.encoding),
+        source_bom = bom_label(encoding.bom),
+        source_delimiter = delimiter_label(table.delimiter),
+        field_count = region.stable_field_count,
+        data_rows = region.fully_numeric_row_count,
+        input_bytes = encoding.original_byte_len,
+    ))
 }
 
 fn format_data_inspection_report(
@@ -685,7 +861,9 @@ fn append_findings(
         .filter_map(|reason| table_reason_message(*reason))
         .collect::<Vec<_>>();
     if compatibility == SimpleCsvCompatibility::RequiresExplicitNormalization {
-        findings.push("explicit normalization is required but is not implemented");
+        findings.push(
+            "explicit normalization is required; data convert accepts only eligible narrow tables",
+        );
     }
 
     if findings.is_empty() {
@@ -838,6 +1016,21 @@ fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> 
 }
 
 fn write_json_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let plan = plan_output_file(output_path)?;
+    plan.execute(bytes).map_err(|error| {
+        CliError::User(format!(
+            "could not write output file `{output_path}`: {error}"
+        ))
+    })
+}
+
+fn write_converted_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let plan = plan_output_file(output_path)?;
+    plan.execute(bytes)
+        .map_err(|error| format_conversion_publication_error(output_path, error))
+}
+
+fn plan_output_file(output_path: &str) -> Result<AtomicWritePlan, CliError> {
     let path = Path::new(output_path);
     if path.as_os_str().is_empty() {
         return Err(CliError::User("output path is empty".to_string()));
@@ -864,15 +1057,23 @@ fn write_json_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliErro
         .map_err(|error| CliError::User(format!("invalid output path `{output_path}`: {error}")))?;
     let request = AtomicWriteRequest::new(PathBuf::from(file_name), Vec::<u8>::new())
         .with_write_mode(WriteMode::CreateNew);
-    let plan = request
+    request
         .plan(&root)
-        .map_err(|error| CliError::User(format!("invalid output path `{output_path}`: {error}")))?;
+        .map_err(|error| CliError::User(format!("invalid output path `{output_path}`: {error}")))
+}
 
-    plan.execute(bytes).map_err(|error| {
-        CliError::User(format!(
-            "could not write output file `{output_path}`: {error}"
-        ))
-    })
+fn format_conversion_publication_error(output_path: &str, error: StorageError) -> CliError {
+    match error {
+        StorageError::TargetAlreadyExists { .. } => {
+            CliError::User(format!("output target `{output_path}` already exists"))
+        }
+        StorageError::ParentDirectoryMissing { .. } => CliError::User(format!(
+            "output parent directory does not exist for `{output_path}`"
+        )),
+        _ => CliError::User(format!(
+            "conversion publication failed for `{output_path}`; the requested target may exist, inspect it before retrying"
+        )),
+    }
 }
 
 fn format_kinetics_error(error: KineticsError) -> CliError {
@@ -1098,6 +1299,7 @@ status: ok
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::path::PathBuf;
 
     use deepseek_science_chemistry::{
         KineticsAnalysisResult, KineticsColumns, ValidatedKineticsInput,
@@ -1106,11 +1308,14 @@ mod tests {
         assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, DataColumn,
         DataTable,
     };
+    use deepseek_science_storage::StorageError;
 
     use super::{
-        format_data_inspection_report, format_kinetics_analysis_output, parse_data_inspect_args,
-        parse_kinetics_analyze_args, read_bounded, run_cli, BoundedReadError, CliError,
-        DataInspectArgs, KineticsAnalyzeArgs,
+        format_conversion_publication_error, format_data_conversion_report,
+        format_data_inspection_report, format_kinetics_analysis_output, parse_data_convert_args,
+        parse_data_inspect_args, parse_kinetics_analyze_args, paths_are_lexically_equal,
+        read_bounded, run_cli, BoundedReadError, CliError, DataConvertArgs, DataInspectArgs,
+        KineticsAnalyzeArgs,
     };
 
     fn parse_args(args: &[&str]) -> Result<KineticsAnalyzeArgs, CliError> {
@@ -1119,6 +1324,10 @@ mod tests {
 
     fn parse_data_args(args: &[&str]) -> Result<DataInspectArgs, CliError> {
         parse_data_inspect_args(args.iter().map(|value| (*value).to_string()))
+    }
+
+    fn parse_convert_args(args: &[&str]) -> Result<DataConvertArgs, CliError> {
+        parse_data_convert_args(args.iter().map(|value| (*value).to_string()))
     }
 
     fn data_report(bytes: &[u8]) -> String {
@@ -1231,8 +1440,136 @@ mod tests {
 
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains("inspect"));
-        assert!(!output.stdout.contains("convert"));
+        assert!(output.stdout.contains("convert"));
         assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn data_convert_arg_parser_accepts_input_and_output() {
+        assert_eq!(
+            parse_convert_args(&["--input", "source.tsv", "--output", "result.csv"]),
+            Ok(DataConvertArgs {
+                input_path: "source.tsv".to_string(),
+                output_path: "result.csv".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn data_convert_arg_parser_rejects_missing_and_duplicate_values() {
+        assert_eq!(
+            parse_convert_args(&["--output", "result.csv"]),
+            Err(CliError::User(
+                "missing required argument --input".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_convert_args(&["--input", "source.tsv"]),
+            Err(CliError::User(
+                "missing required argument --output".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_convert_args(&["--input"]),
+            Err(CliError::User("missing value for --input".to_string()))
+        );
+        assert_eq!(
+            parse_convert_args(&["--output"]),
+            Err(CliError::User("missing value for --output".to_string()))
+        );
+        assert_eq!(
+            parse_convert_args(&[
+                "--input",
+                "one.tsv",
+                "--input",
+                "two.tsv",
+                "--output",
+                "result.csv",
+            ]),
+            Err(CliError::User("duplicate argument --input".to_string()))
+        );
+        assert_eq!(
+            parse_convert_args(&[
+                "--input",
+                "source.tsv",
+                "--output",
+                "one.csv",
+                "--output",
+                "two.csv",
+            ]),
+            Err(CliError::User("duplicate argument --output".to_string()))
+        );
+    }
+
+    #[test]
+    fn data_convert_arg_parser_rejects_unknown_options() {
+        for option in ["--json", "--force", "--overwrite", "--in-place"] {
+            assert_eq!(
+                parse_convert_args(&[option]),
+                Err(CliError::User(format!("unknown argument {option}")))
+            );
+        }
+    }
+
+    #[test]
+    fn data_convert_help_documents_narrow_contract() {
+        let output = run_cli(["deepseek-science", "data", "convert", "--help"]);
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output
+            .stdout
+            .contains("data convert --input <path> --output <path>"));
+        assert!(output.stdout.contains("16 MiB"));
+        assert!(output.stdout.contains("24 MiB"));
+        assert!(output.stdout.contains("exactly one final LF"));
+        assert!(output.stdout.contains("never overwritten"));
+        assert!(output
+            .stdout
+            .contains("already-compatible input is rejected"));
+        assert!(output.stdout.contains("no JSON mode exists"));
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn lexical_path_equality_is_checked_without_filesystem_io() {
+        assert!(paths_are_lexically_equal("input.csv", "input.csv"));
+        assert!(!paths_are_lexically_equal("input.csv", "output.csv"));
+    }
+
+    #[test]
+    fn data_conversion_report_is_deterministic_and_has_one_newline() {
+        let encoding = inspect_text_encoding(b"A\tB\n1\t2\n").expect("text should decode");
+        let table = inspect_delimited_text(&encoding.text).expect("text should inspect");
+        let first =
+            format_data_conversion_report(&encoding, &table, 8).expect("report should format");
+        let second =
+            format_data_conversion_report(&encoding, &table, 8).expect("report should format");
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("conversion_status: complete\n"));
+        assert!(first.contains("source_delimiter: tab\n"));
+        assert!(first.ends_with('\n'));
+        assert!(!first.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn conversion_publication_errors_hide_temporary_paths() {
+        let error = format_conversion_publication_error(
+            "result.csv",
+            StorageError::WriteFailed {
+                path: PathBuf::from("secret.atomic-write.tmp"),
+                reason: "denied".to_string(),
+            },
+        );
+
+        assert_eq!(
+            error,
+            CliError::User(
+                "conversion publication failed for `result.csv`; the requested target may exist, inspect it before retrying"
+                    .to_string()
+            )
+        );
+        assert!(!format!("{error:?}").contains("secret.atomic-write.tmp"));
     }
 
     #[test]

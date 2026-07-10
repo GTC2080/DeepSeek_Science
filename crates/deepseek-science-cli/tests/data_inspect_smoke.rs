@@ -130,7 +130,7 @@ fn utf8_bom_comma_table_requires_normalization() {
     assert!(stdout.contains("encoding: utf-8\n"));
     assert!(stdout.contains("bom: utf-8\n"));
     assert!(stdout.contains("simple_csv_compatibility: requires-explicit-normalization\n"));
-    assert!(stdout.contains("normalization is required but is not implemented"));
+    assert!(stdout.contains("data convert accepts only eligible narrow tables"));
     cleanup_input(&directory, &input);
 }
 
