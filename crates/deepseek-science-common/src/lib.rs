@@ -6,6 +6,7 @@
 //! workflows.
 
 pub mod csv;
+pub mod delimited;
 pub mod encoding;
 pub mod error;
 pub mod fitting;
@@ -14,6 +15,11 @@ pub mod table;
 pub mod units;
 
 pub use csv::parse_simple_numeric_csv;
+pub use delimited::{
+    assess_simple_csv_compatibility, inspect_delimited_text, BoundedLineEvidence,
+    DelimitedInspectionError, DelimitedTextInspection, DelimiterFinding, GenericTableShape,
+    SimpleCsvCompatibility, TableRegionInspection, TableShapeReason,
+};
 pub use encoding::{
     inspect_text_encoding, ByteOrderMark, EncodingInspection, EncodingInspectionError,
     TextEncoding, MAX_INSPECTION_BYTES,
