@@ -107,7 +107,9 @@ The implemented user-facing analysis command is:
 deepseek-science kinetics analyze \
   --input <path> \
   --time-column <column> \
-  --concentration-column <column>
+  --concentration-column <column> \
+  [--json] \
+  [--output <path>]
 ```
 
 Example CSV input:
@@ -203,6 +205,21 @@ Minimal JSON shape:
 The preferred model is preferred by the MVP finite `r_squared` heuristic and is
 not final scientific model selection.
 
+Successful analysis can also explicitly save the same deterministic JSON:
+
+```sh
+deepseek-science kinetics analyze \
+  --input crates/deepseek-science-cli/tests/fixtures/kinetics_success.csv \
+  --time-column time_s \
+  --concentration-column concentration_mol_l \
+  --output result.json
+```
+
+Without `--output`, the command remains no-write. The parent directory must
+already exist, and the output target must not exist because files are never
+overwritten. With `--json --output`, stdout and the saved file contain
+byte-identical JSON.
+
 Current limitations:
 
 - No DeepSeek or other model calls.
@@ -211,15 +228,17 @@ Current limitations:
 - No CSV autodetection or full CSV dialect support.
 - No plotting.
 - No JSON error schema.
-- No output file flag.
+- No output overwrite support.
 - No artifact persistence.
 - No storage records or project workspace storage.
 - No UI.
 - No notebook, Jupyter, R, PubMed, or HPC integrations.
 
-Disk safety: the command reads exactly one input file, writes no output files,
-creates no storage records, creates no logs, caches, or temp directories, and
-prints only to stdout/stderr. JSON output goes to stdout only.
+Disk safety: without `--output`, the command reads exactly one input file and
+writes no files. Explicit `--output` may create one bounded sibling temporary
+file while atomically publishing one JSON target. It creates no parent
+directories, storage records, logs, caches, artifacts, run records, or project
+workspace state.
 
 ## Phase 1 Boundaries
 
