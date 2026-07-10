@@ -5,6 +5,7 @@
 //! command-line framework before the command surface exists.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use deepseek_science_artifacts::hash_bytes;
@@ -13,7 +14,13 @@ use deepseek_science_chemistry::{
     KineticsModelKind, KineticsReviewCheckKind, KineticsReviewSeverity, KineticsReviewStatus,
     ValidatedKineticsInput,
 };
-use deepseek_science_common::{mean, parse_simple_numeric_csv};
+use deepseek_science_common::{
+    assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, mean,
+    parse_simple_numeric_csv, BoundedLineEvidence, ByteOrderMark, DelimitedInspectionError,
+    DelimitedTextInspection, DelimiterFinding, EncodingInspection, EncodingInspectionError,
+    GenericTableShape, SimpleCsvCompatibility, TableShapeReason, TextEncoding,
+    MAX_INSPECTION_BYTES,
+};
 use deepseek_science_core::ProjectId;
 use deepseek_science_model::ModelCapabilities;
 use deepseek_science_model_deepseek::DeepSeekModel;
@@ -85,6 +92,20 @@ struct KineticsAnalyzeArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct DataInspectArgs {
+    input_path: String,
+}
+
+#[derive(Debug)]
+enum BoundedReadError {
+    Io(io::Error),
+    LimitExceeded,
+}
+
+const MAX_DISPLAYED_HEADERS: usize = 32;
+const MAX_HEADER_DISPLAY_CHARS: usize = 120;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CliError {
     User(String),
     Internal(String),
@@ -105,13 +126,48 @@ where
             CliOutput::success(format!("deepseek-science {}\n", env!("CARGO_PKG_VERSION")))
         }
         Some("kinetics") => run_kinetics_command(args),
+        Some("data") => run_data_command(args),
         Some("help") | Some("--help") | Some("-h") | None => CliOutput::success(usage()),
         Some(command) => CliOutput::command_error(format!("unknown command: {command}")),
     }
 }
 
 fn usage() -> String {
-    "Usage: deepseek-science <doctor|version|help|kinetics>\n".to_owned()
+    "\
+Usage: deepseek-science <doctor|version|help|kinetics|data>
+
+Commands:
+  data inspect   Inspect one laboratory text file without modifying it
+"
+    .to_owned()
+}
+
+fn data_usage() -> &'static str {
+    "\
+Usage: deepseek-science data <inspect>
+
+Commands:
+  inspect   Inspect one explicit laboratory text file without writing files
+"
+}
+
+fn data_inspect_usage() -> &'static str {
+    "\
+Usage:
+  deepseek-science data inspect --input <path>
+
+Options:
+  --input <path>   Path to one regular laboratory text file
+  -h, --help       Show this help
+
+Limits and behavior:
+  Input is limited to 16 MiB.
+  Supported text is UTF-8, UTF-8 with BOM, or UTF-16LE/BE with a BOM.
+  Only comma and tab delimiters are inspected.
+  The command writes no files or hidden state.
+  It does not modify, normalize, convert, or analyze the input.
+  Incompatible table structure is reported rather than repaired.
+"
 }
 
 fn kinetics_usage() -> &'static str {
@@ -137,6 +193,93 @@ Notes:
   Existing targets are not overwritten, and parent directories are not created.
   Errors are written to stderr.
 "
+}
+
+fn run_data_command<I>(args: I) -> CliOutput
+where
+    I: IntoIterator<Item = String>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    match args.as_slice() {
+        [flag] if flag == "--help" || flag == "-h" => CliOutput::success(data_usage().to_string()),
+        [subcommand, remaining @ ..] if subcommand == "inspect" => {
+            run_data_inspect(remaining.iter().cloned())
+        }
+        [command, ..] => CliOutput::user_error_with_usage(
+            format!("unknown data subcommand: {command}"),
+            data_usage(),
+        ),
+        [] => CliOutput::user_error_with_usage("missing data subcommand", data_usage()),
+    }
+}
+
+fn run_data_inspect<I>(args: I) -> CliOutput
+where
+    I: IntoIterator<Item = String>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
+        return CliOutput::success(data_inspect_usage().to_string());
+    }
+
+    let args = match parse_data_inspect_args(args) {
+        Ok(args) => args,
+        Err(CliError::User(message)) => {
+            return CliOutput::user_error_with_usage(message, data_inspect_usage());
+        }
+        Err(CliError::Internal(message)) => return CliOutput::internal_error(message),
+    };
+
+    match inspect_data_file(&args.input_path) {
+        Ok(output) => CliOutput::success(output),
+        Err(CliError::User(message)) => CliOutput::user_error(message),
+        Err(CliError::Internal(message)) => CliOutput::internal_error(message),
+    }
+}
+
+fn parse_data_inspect_args<I>(args: I) -> Result<DataInspectArgs, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut input_path = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--input" => {
+                let value = next_data_option_value(&mut args, "--input")?;
+                set_required_arg(&mut input_path, "--input", value)?;
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::User(format!("unknown argument {value}")));
+            }
+            value => {
+                return Err(CliError::User(format!(
+                    "unexpected positional argument {value}"
+                )));
+            }
+        }
+    }
+
+    Ok(DataInspectArgs {
+        input_path: input_path
+            .ok_or_else(|| CliError::User("missing required argument --input".to_string()))?,
+    })
+}
+
+fn next_data_option_value<I>(args: &mut I, option_name: &str) -> Result<String, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(value) = args.next() else {
+        return Err(CliError::User(format!("missing value for {option_name}")));
+    };
+
+    if value.is_empty() || value.starts_with('-') {
+        return Err(CliError::User(format!("missing value for {option_name}")));
+    }
+
+    Ok(value)
 }
 
 fn run_kinetics_command<I>(mut args: I) -> CliOutput
@@ -272,6 +415,380 @@ fn set_flag(target: &mut bool, option_name: &str) -> Result<(), CliError> {
 
     *target = true;
     Ok(())
+}
+
+fn inspect_data_file(input_path: &str) -> Result<String, CliError> {
+    let file = fs::File::open(input_path).map_err(|error| {
+        CliError::User(format!("could not open input file `{input_path}`: {error}"))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        CliError::User(format!(
+            "could not inspect input file `{input_path}`: {error}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(CliError::User(format!(
+            "input path `{input_path}` must refer to a regular file"
+        )));
+    }
+    if metadata.len() > MAX_INSPECTION_BYTES as u64 {
+        return Err(CliError::User(format!(
+            "input file `{input_path}` exceeds the fixed 16 MiB inspection limit"
+        )));
+    }
+
+    let bytes = match read_bounded(file, MAX_INSPECTION_BYTES) {
+        Ok(bytes) => bytes,
+        Err(BoundedReadError::LimitExceeded) => {
+            return Err(CliError::User(format!(
+                "input file `{input_path}` exceeds the fixed 16 MiB inspection limit"
+            )));
+        }
+        Err(BoundedReadError::Io(error)) => {
+            return Err(CliError::User(format!(
+                "could not read input file `{input_path}`: {error}"
+            )));
+        }
+    };
+    let encoding = inspect_text_encoding(&bytes).map_err(format_encoding_inspection_error)?;
+    let table =
+        inspect_delimited_text(&encoding.text).map_err(format_delimited_inspection_error)?;
+    let compatibility = assess_simple_csv_compatibility(&encoding, &table);
+
+    Ok(format_data_inspection_report(
+        &encoding,
+        &table,
+        compatibility,
+    ))
+}
+
+fn read_bounded<R: Read>(reader: R, maximum: usize) -> Result<Vec<u8>, BoundedReadError> {
+    let mut bytes = Vec::new();
+    let mut limited = reader.take((maximum as u64).saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(BoundedReadError::Io)?;
+
+    if bytes.len() > maximum {
+        Err(BoundedReadError::LimitExceeded)
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn format_encoding_inspection_error(error: EncodingInspectionError) -> CliError {
+    let message = match error {
+        EncodingInspectionError::InspectionLimitExceeded { actual, maximum } => format!(
+            "input has {actual} bytes, exceeding the fixed 16 MiB inspection limit of {maximum} bytes"
+        ),
+        EncodingInspectionError::UnsupportedBinaryInput { byte_offset } => format!(
+            "unsupported binary or NUL input at byte offset {byte_offset}"
+        ),
+        EncodingInspectionError::UnsupportedOrAmbiguousEncoding { byte_offset } => format!(
+            "unsupported or ambiguous encoding at byte offset {byte_offset}; BOM-free UTF-16 is not detected"
+        ),
+        EncodingInspectionError::InvalidUtf8 { byte_offset } => {
+            format!("invalid UTF-8 at original-input byte offset {byte_offset}")
+        }
+        EncodingInspectionError::InvalidUtf16 { byte_offset } => {
+            format!("invalid UTF-16 at original-input byte offset {byte_offset}")
+        }
+    };
+
+    CliError::User(message)
+}
+
+fn format_delimited_inspection_error(error: DelimitedInspectionError) -> CliError {
+    match error {
+        DelimitedInspectionError::InspectionLimitExceeded { actual, maximum } => CliError::User(
+            format!(
+                "decoded text has {actual} bytes, exceeding the fixed 16 MiB inspection limit of {maximum} bytes"
+            ),
+        ),
+    }
+}
+
+fn format_data_inspection_report(
+    encoding: &EncodingInspection,
+    table: &DelimitedTextInspection,
+    compatibility: SimpleCsvCompatibility,
+) -> String {
+    let mut output = format!(
+        "\
+inspection_status: {inspection_status}
+encoding: {encoding}
+bom: {bom}
+input_bytes: {input_bytes}
+delimiter: {delimiter}
+physical_lines: {physical_lines}
+blank_lines: {blank_lines}
+nonblank_lines: {nonblank_lines}
+",
+        inspection_status = if table.complete {
+            "complete"
+        } else {
+            "partial"
+        },
+        encoding = text_encoding_label(encoding.encoding),
+        bom = bom_label(encoding.bom),
+        input_bytes = encoding.original_byte_len,
+        delimiter = delimiter_label(table.delimiter),
+        physical_lines = table.physical_line_count,
+        blank_lines = table.blank_line_count,
+        nonblank_lines = table.nonblank_line_count,
+    );
+
+    if let Some(region) = table.region.as_ref() {
+        output.push_str(&format!(
+            "\
+table_region: {first}-{last}
+field_count: {field_count}
+header_lines: {header_lines}
+",
+            first = region.first_line,
+            last = region.last_line,
+            field_count = region.stable_field_count,
+            header_lines = format_line_evidence(&region.header_candidate_lines),
+        ));
+        append_headers(&mut output, &region.header_labels);
+        output.push_str(&format!(
+            "\
+fully_numeric_rows: {fully_numeric_rows}
+nonnumeric_rows: {nonnumeric_rows}
+nonnumeric_lines: {nonnumeric_lines}
+metadata_lines: {metadata_lines}
+inconsistent_width_lines: {inconsistent_width_lines}
+additional_content_lines: {additional_content_lines}
+empty_cell_lines: {empty_cell_lines}
+non_finite_numeric_lines: {non_finite_numeric_lines}
+",
+            fully_numeric_rows = region.fully_numeric_row_count,
+            nonnumeric_rows = region.nonnumeric_row_count,
+            nonnumeric_lines = format_line_evidence(&region.nonnumeric_lines),
+            metadata_lines = format_line_evidence(&region.metadata_lines),
+            inconsistent_width_lines = format_line_evidence(&region.inconsistent_width_lines),
+            additional_content_lines = format_line_evidence(&region.additional_content_lines),
+            empty_cell_lines = format_line_evidence(&region.empty_numeric_cell_lines),
+            non_finite_numeric_lines = format_line_evidence(&region.non_finite_numeric_lines),
+        ));
+    } else {
+        output.push_str(
+            "\
+table_region: none
+field_count: none
+header_lines: none
+headers: none
+fully_numeric_rows: none
+nonnumeric_rows: none
+nonnumeric_lines: none
+metadata_lines: none
+inconsistent_width_lines: none
+additional_content_lines: none
+empty_cell_lines: none
+non_finite_numeric_lines: none
+",
+        );
+    }
+
+    output.push_str(&format!(
+        "\
+quoted_lines: {quoted_lines}
+shape: {shape}
+simple_csv_compatibility: {compatibility}
+current_kinetics_workflow: {kinetics_compatibility}
+",
+        quoted_lines = format_line_evidence(&table.quoted_lines),
+        shape = table_shape_label(table.shape),
+        compatibility = simple_csv_compatibility_label(compatibility),
+        kinetics_compatibility = kinetics_compatibility_label(compatibility),
+    ));
+    append_findings(&mut output, table, compatibility);
+
+    output
+}
+
+fn append_headers(output: &mut String, headers: &[String]) {
+    if headers.is_empty() {
+        output.push_str("headers: none\n");
+        return;
+    }
+
+    output.push_str("headers:\n");
+    for header in headers.iter().take(MAX_DISPLAYED_HEADERS) {
+        output.push_str("  - ");
+        output.push_str(&sanitize_header_label(header));
+        output.push('\n');
+    }
+    if headers.len() > MAX_DISPLAYED_HEADERS {
+        output.push_str(&format!(
+            "  - ... [{} additional headers omitted]\n",
+            headers.len() - MAX_DISPLAYED_HEADERS
+        ));
+    }
+}
+
+fn sanitize_header_label(label: &str) -> String {
+    let mut output = String::new();
+    let mut characters = label.chars();
+
+    for _ in 0..MAX_HEADER_DISPLAY_CHARS {
+        let Some(character) = characters.next() else {
+            return output;
+        };
+        match character {
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            '\\' => output.push_str("\\\\"),
+            value if value.is_control() || matches!(value, '\u{2028}' | '\u{2029}') => {
+                output.push_str(&format!("\\u{{{:x}}}", value as u32));
+            }
+            value => output.push(value),
+        }
+    }
+
+    if characters.next().is_some() {
+        output.push_str("… [truncated]");
+    }
+    output
+}
+
+fn format_line_evidence(evidence: &BoundedLineEvidence) -> String {
+    if evidence.total_count == 0 {
+        return "none".to_string();
+    }
+
+    let examples = evidence
+        .example_lines
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    if evidence.additional_examples_omitted {
+        format!(
+            "{examples} (total: {}; additional omitted)",
+            evidence.total_count
+        )
+    } else {
+        examples
+    }
+}
+
+fn append_findings(
+    output: &mut String,
+    table: &DelimitedTextInspection,
+    compatibility: SimpleCsvCompatibility,
+) {
+    let mut findings = table
+        .reasons
+        .iter()
+        .filter_map(|reason| table_reason_message(*reason))
+        .collect::<Vec<_>>();
+    if compatibility == SimpleCsvCompatibility::RequiresExplicitNormalization {
+        findings.push("explicit normalization is required but is not implemented");
+    }
+
+    if findings.is_empty() {
+        output.push_str("findings: none\n");
+    } else {
+        output.push_str("findings:\n");
+        for finding in findings {
+            output.push_str("  - ");
+            output.push_str(finding);
+            output.push('\n');
+        }
+    }
+}
+
+fn text_encoding_label(encoding: TextEncoding) -> &'static str {
+    match encoding {
+        TextEncoding::Utf8 => "utf-8",
+        TextEncoding::Utf16Le => "utf-16le",
+        TextEncoding::Utf16Be => "utf-16be",
+    }
+}
+
+fn bom_label(bom: ByteOrderMark) -> &'static str {
+    match bom {
+        ByteOrderMark::None => "none",
+        ByteOrderMark::Utf8 => "utf-8",
+        ByteOrderMark::Utf16Le => "utf-16le",
+        ByteOrderMark::Utf16Be => "utf-16be",
+    }
+}
+
+fn delimiter_label(delimiter: DelimiterFinding) -> &'static str {
+    match delimiter {
+        DelimiterFinding::Comma => "comma",
+        DelimiterFinding::Tab => "tab",
+        DelimiterFinding::Ambiguous => "ambiguous",
+        DelimiterFinding::Unsupported => "unsupported",
+    }
+}
+
+fn table_shape_label(shape: GenericTableShape) -> &'static str {
+    match shape {
+        GenericTableShape::NumericNarrowTable => "numeric-narrow-table",
+        GenericTableShape::NumericMatrix => "numeric-matrix",
+        GenericTableShape::MixedOrUnsupported => "mixed-or-unsupported",
+        GenericTableShape::Empty => "empty",
+    }
+}
+
+fn simple_csv_compatibility_label(compatibility: SimpleCsvCompatibility) -> &'static str {
+    match compatibility {
+        SimpleCsvCompatibility::CompatibleAsIs => "compatible-as-is",
+        SimpleCsvCompatibility::RequiresExplicitNormalization => "requires-explicit-normalization",
+        SimpleCsvCompatibility::Incompatible => "incompatible",
+    }
+}
+
+fn kinetics_compatibility_label(compatibility: SimpleCsvCompatibility) -> &'static str {
+    match compatibility {
+        SimpleCsvCompatibility::CompatibleAsIs => {
+            "potentially-compatible-after-explicit-column-selection"
+        }
+        SimpleCsvCompatibility::RequiresExplicitNormalization => {
+            "requires-normalization-before-analysis"
+        }
+        SimpleCsvCompatibility::Incompatible => "incompatible",
+    }
+}
+
+fn table_reason_message(reason: TableShapeReason) -> Option<&'static str> {
+    match reason {
+        TableShapeReason::NoUsableTable => Some("no usable table rows were found"),
+        TableShapeReason::QuotedInput => Some("quoted or multiline field parsing is unsupported"),
+        TableShapeReason::UnsupportedDelimiter => {
+            Some("no stable comma or tab table region was found")
+        }
+        TableShapeReason::AmbiguousDelimiter => {
+            Some("comma and tab table regions are equally plausible")
+        }
+        TableShapeReason::AmbiguousTableRegion => {
+            Some("multiple table regions are equally plausible")
+        }
+        TableShapeReason::MissingNamedHeader => Some("a named header row was not established"),
+        TableShapeReason::MultipleHeaderRows => {
+            Some("multiple header or unit rows require an explicit decision")
+        }
+        TableShapeReason::EmptyHeaderLabel => Some("a header label is empty"),
+        TableShapeReason::DuplicateHeaderLabel => Some("a header label is duplicated"),
+        TableShapeReason::NonnumericBody => Some("nonnumeric rows appear inside the numeric body"),
+        TableShapeReason::InconsistentFieldCount => Some("inconsistent field counts were observed"),
+        TableShapeReason::AdditionalTableContent => {
+            Some("additional nonblank content follows the selected table region")
+        }
+        TableShapeReason::EmptyNumericCell => Some("an empty cell was observed"),
+        TableShapeReason::NonFiniteNumericCell => Some("a non-finite numeric cell was observed"),
+        TableShapeReason::MetadataBeforeTable => {
+            Some("metadata appears before the selected table region")
+        }
+        TableShapeReason::NamedFiniteRectangle => None,
+        TableShapeReason::MonotonicSiblingMatrix => {
+            Some("numeric matrix structure is not accepted by the current kinetics workflow")
+        }
+    }
 }
 
 fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> {
@@ -580,18 +1097,36 @@ status: ok
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use deepseek_science_chemistry::{
         KineticsAnalysisResult, KineticsColumns, ValidatedKineticsInput,
     };
-    use deepseek_science_common::{DataColumn, DataTable};
+    use deepseek_science_common::{
+        assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, DataColumn,
+        DataTable,
+    };
 
     use super::{
-        format_kinetics_analysis_output, parse_kinetics_analyze_args, run_cli, CliError,
-        KineticsAnalyzeArgs,
+        format_data_inspection_report, format_kinetics_analysis_output, parse_data_inspect_args,
+        parse_kinetics_analyze_args, read_bounded, run_cli, BoundedReadError, CliError,
+        DataInspectArgs, KineticsAnalyzeArgs,
     };
 
     fn parse_args(args: &[&str]) -> Result<KineticsAnalyzeArgs, CliError> {
         parse_kinetics_analyze_args(args.iter().map(|value| (*value).to_string()))
+    }
+
+    fn parse_data_args(args: &[&str]) -> Result<DataInspectArgs, CliError> {
+        parse_data_inspect_args(args.iter().map(|value| (*value).to_string()))
+    }
+
+    fn data_report(bytes: &[u8]) -> String {
+        let encoding = inspect_text_encoding(bytes).expect("test bytes should decode");
+        let table = inspect_delimited_text(&encoding.text).expect("test text should inspect");
+        let compatibility = assess_simple_csv_compatibility(&encoding, &table);
+
+        format_data_inspection_report(&encoding, &table, compatibility)
     }
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -619,6 +1154,124 @@ mod tests {
         assert_eq!(output.exit_code, 0);
         assert!(output.stdout.contains(env!("CARGO_PKG_VERSION")));
         assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn data_inspect_arg_parser_accepts_input() {
+        assert_eq!(
+            parse_data_args(&["--input", "sample.csv"]),
+            Ok(DataInspectArgs {
+                input_path: "sample.csv".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn data_inspect_arg_parser_rejects_missing_input() {
+        assert_eq!(
+            parse_data_args(&[]),
+            Err(CliError::User(
+                "missing required argument --input".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn data_inspect_arg_parser_rejects_missing_input_value() {
+        assert_eq!(
+            parse_data_args(&["--input"]),
+            Err(CliError::User("missing value for --input".to_string()))
+        );
+    }
+
+    #[test]
+    fn data_inspect_arg_parser_rejects_duplicate_input() {
+        assert_eq!(
+            parse_data_args(&["--input", "one.csv", "--input", "two.csv"]),
+            Err(CliError::User("duplicate argument --input".to_string()))
+        );
+    }
+
+    #[test]
+    fn data_inspect_arg_parser_rejects_unknown_options() {
+        assert_eq!(
+            parse_data_args(&["--json"]),
+            Err(CliError::User("unknown argument --json".to_string()))
+        );
+        assert_eq!(
+            parse_data_args(&["--output", "report.txt"]),
+            Err(CliError::User("unknown argument --output".to_string()))
+        );
+    }
+
+    #[test]
+    fn data_inspect_arg_parser_rejects_unexpected_positionals() {
+        assert_eq!(
+            parse_data_args(&["--input", "one.csv", "two.csv"]),
+            Err(CliError::User(
+                "unexpected positional argument two.csv".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn data_inspect_help_prints_usage_without_error() {
+        let output = run_cli(["deepseek-science", "data", "inspect", "--help"]);
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("data inspect --input <path>"));
+        assert!(output.stdout.contains("16 MiB"));
+        assert!(output.stdout.contains("writes no files"));
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn data_parent_help_prints_inspect_without_error() {
+        let output = run_cli(["deepseek-science", "data", "-h"]);
+
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("inspect"));
+        assert!(!output.stdout.contains("convert"));
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn bounded_reader_accepts_exact_limit() {
+        assert_eq!(
+            read_bounded(Cursor::new(b"abcd"), 4).expect("exact limit should read"),
+            b"abcd"
+        );
+    }
+
+    #[test]
+    fn bounded_reader_rejects_limit_plus_one() {
+        assert!(matches!(
+            read_bounded(Cursor::new(b"abcde"), 4),
+            Err(BoundedReadError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn data_inspection_report_is_deterministic() {
+        let bytes = b"axis,value\n1,2\n3,4\n";
+
+        assert_eq!(data_report(bytes), data_report(bytes));
+    }
+
+    #[test]
+    fn data_inspection_report_escapes_header_control_characters() {
+        let output = data_report(b"safe\x1b[2J,value\n1,2\n");
+
+        assert!(output.contains("safe\\u{1b}[2J"));
+        assert!(!output.contains('\x1b'));
+    }
+
+    #[test]
+    fn data_inspection_report_ends_with_one_newline() {
+        let output = data_report(b"axis,value\n1,2\n");
+
+        assert!(output.ends_with('\n'));
+        assert!(!output.ends_with("\n\n"));
     }
 
     #[test]
