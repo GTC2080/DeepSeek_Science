@@ -101,6 +101,26 @@ Crate-specific check and test aliases are defined in `.cargo/config.toml`.
 
 ## Current CLI MVP
 
+### Read-only laboratory data inspection
+
+Inspect one explicit laboratory text file without modifying it:
+
+```sh
+deepseek-science data inspect --input <path>
+```
+
+Inspection is read-only and limited to 16 MiB. It supports UTF-8 with or
+without a BOM, plus UTF-16LE and UTF-16BE when the corresponding BOM is
+present. Only comma and tab delimiters are inspected. The report describes the
+encoding, BOM, delimiter, bounded table evidence, generic shape, and current
+kinetics-workflow compatibility.
+
+Structural incompatibility is reported without repairing or rewriting the
+input. Inspection does not select chemistry columns, run kinetics analysis,
+create project state, or write files. Data conversion is not implemented yet.
+
+### Kinetics analysis
+
 The implemented user-facing analysis command is:
 
 ```sh
@@ -224,8 +244,14 @@ Current limitations:
 
 - No DeepSeek or other model calls.
 - No model-generated explanations.
+- No model-based encoding, delimiter, table, or chemistry detection.
 - No tool execution.
-- No CSV autodetection or full CSV dialect support.
+- No data conversion or automatic normalization.
+- No full CSV dialect support, quoted fields, or multiline fields.
+- No semicolon delimiter or locale-dependent number detection.
+- No Excel or proprietary binary instrument formats.
+- No automatic chemistry interpretation or column selection.
+- No batch or recursive data import.
 - No plotting.
 - No JSON error schema.
 - No output overwrite support.
@@ -234,9 +260,10 @@ Current limitations:
 - No UI.
 - No notebook, Jupyter, R, PubMed, or HPC integrations.
 
-Disk safety: without `--output`, the command reads exactly one input file and
-writes no files. Explicit `--output` may create one bounded sibling temporary
-file while atomically publishing one JSON target. It creates no parent
+Disk safety: `data inspect` reads exactly one explicit regular file and writes
+nothing. For `kinetics analyze`, omitting `--output` also writes no files.
+Explicit analysis `--output` may create one bounded sibling temporary file
+while atomically publishing one JSON target. These commands create no parent
 directories, storage records, logs, caches, artifacts, run records, or project
 workspace state.
 
