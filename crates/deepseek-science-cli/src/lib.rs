@@ -5,6 +5,7 @@
 //! command-line framework before the command surface exists.
 
 use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use deepseek_science_artifacts::hash_bytes;
 use deepseek_science_chemistry::{
@@ -18,7 +19,7 @@ use deepseek_science_model::ModelCapabilities;
 use deepseek_science_model_deepseek::DeepSeekModel;
 use deepseek_science_prompt::PromptVersionInfo;
 use deepseek_science_sandbox::SandboxPolicy;
-use deepseek_science_storage::StorageLayout;
+use deepseek_science_storage::{AtomicWriteRequest, StorageLayout, StorageRoot, WriteMode};
 use deepseek_science_tools::ToolRegistry;
 
 /// CLI command output and process status.
@@ -80,6 +81,7 @@ struct KineticsAnalyzeArgs {
     time_column: String,
     concentration_column: String,
     json_output: bool,
+    output_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,19 +121,21 @@ fn kinetics_usage() -> &'static str {
 fn kinetics_analyze_usage() -> &'static str {
     "\
 Usage:
-  deepseek-science kinetics analyze --input <path> --time-column <column> --concentration-column <column> [--json]
+  deepseek-science kinetics analyze --input <path> --time-column <column> --concentration-column <column> [--json] [--output <path>]
 
 Options:
   --input <path>                    Path to a simple numeric CSV file
   --time-column <column>            Time column name
   --concentration-column <column>   Concentration column name
   --json                            Write successful analysis as JSON to stdout
+  --output <path>                   Save successful analysis as deterministic JSON
   -h, --help                        Show this help
 
 Notes:
-  Text output is the default.
+  Text output is the default. --json controls the stdout format.
+  --output explicitly saves JSON after successful analysis.
+  Existing targets are not overwritten, and parent directories are not created.
   Errors are written to stderr.
-  JSON mode does not change error output.
 "
 }
 
@@ -185,6 +189,7 @@ where
     let mut time_column = None;
     let mut concentration_column = None;
     let mut json_output = false;
+    let mut output_path = None;
     let mut args = args.into_iter();
 
     while let Some(argument) = args.next() {
@@ -203,6 +208,10 @@ where
             }
             "--json" => {
                 set_flag(&mut json_output, "--json")?;
+            }
+            "--output" => {
+                let value = next_option_value(&mut args, "--output")?;
+                set_required_arg(&mut output_path, "--output", value)?;
             }
             value if value.starts_with("--") => {
                 return Err(CliError::User(format!("unknown argument {value}")));
@@ -224,6 +233,7 @@ where
             CliError::User("missing required argument --concentration-column".to_string())
         })?,
         json_output,
+        output_path,
     })
 }
 
@@ -279,13 +289,27 @@ fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> 
         ValidatedKineticsInput::from_table(&table, &columns).map_err(format_kinetics_error)?;
     let analysis = KineticsAnalysisResult::analyze(&input).map_err(format_kinetics_error)?;
 
-    if args.json_output {
-        format_kinetics_analysis_json_output(
+    let json_output = if args.json_output || args.output_path.is_some() {
+        Some(format_kinetics_analysis_json_output(
             &args.input_path,
             &args.time_column,
             &args.concentration_column,
             &analysis,
-        )
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(output_path) = args.output_path.as_deref() {
+        let bytes = json_output
+            .as_deref()
+            .ok_or_else(|| CliError::Internal("JSON output was not prepared".to_string()))?
+            .as_bytes();
+        write_json_output_file(output_path, bytes)?;
+    }
+
+    if args.json_output {
+        json_output.ok_or_else(|| CliError::Internal("JSON output was not prepared".to_string()))
     } else {
         Ok(format_kinetics_analysis_output(
             &args.input_path,
@@ -294,6 +318,44 @@ fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> 
             &analysis,
         ))
     }
+}
+
+fn write_json_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let path = Path::new(output_path);
+    if path.as_os_str().is_empty() {
+        return Err(CliError::User("output path is empty".to_string()));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(CliError::User(format!(
+            "invalid output path `{output_path}`: parent directory traversal is not allowed"
+        )));
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        CliError::User(format!(
+            "invalid output path `{output_path}`: target must include a file name"
+        ))
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let root = StorageRoot::new(parent.to_path_buf())
+        .map_err(|error| CliError::User(format!("invalid output path `{output_path}`: {error}")))?;
+    let request = AtomicWriteRequest::new(PathBuf::from(file_name), Vec::<u8>::new())
+        .with_write_mode(WriteMode::CreateNew);
+    let plan = request
+        .plan(&root)
+        .map_err(|error| CliError::User(format!("invalid output path `{output_path}`: {error}")))?;
+
+    plan.execute(bytes).map_err(|error| {
+        CliError::User(format!(
+            "could not write output file `{output_path}`: {error}"
+        ))
+    })
 }
 
 fn format_kinetics_error(error: KineticsError) -> CliError {
@@ -582,6 +644,7 @@ mod tests {
         assert_eq!(args.input_path, "kinetics.csv");
         assert_eq!(args.time_column, "time_s");
         assert_eq!(args.concentration_column, "concentration_mol_l");
+        assert_eq!(args.output_path, None);
     }
 
     #[test]
@@ -646,6 +709,64 @@ mod tests {
         assert_eq!(args.input_path, "kinetics.csv");
         assert_eq!(args.time_column, "time_s");
         assert_eq!(args.concentration_column, "concentration_mol_l");
+        assert!(args.json_output);
+        assert_eq!(args.output_path, None);
+    }
+
+    #[test]
+    fn kinetics_analyze_arg_parser_accepts_output_path() {
+        let args = parse_args(&[
+            "--input",
+            "kinetics.csv",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--output",
+            "result.json",
+        ])
+        .expect("valid args with --output should parse");
+
+        assert_eq!(args.output_path.as_deref(), Some("result.json"));
+    }
+
+    #[test]
+    fn kinetics_analyze_arg_parser_rejects_duplicate_output_path() {
+        let result = parse_args(&[
+            "--input",
+            "kinetics.csv",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--output",
+            "result.json",
+            "--output",
+            "again.json",
+        ]);
+
+        assert_eq!(
+            result,
+            Err(CliError::User("duplicate argument --output".to_string()))
+        );
+    }
+
+    #[test]
+    fn kinetics_analyze_arg_parser_rejects_missing_output_value() {
+        let result = parse_args(&[
+            "--input",
+            "kinetics.csv",
+            "--time-column",
+            "time_s",
+            "--concentration-column",
+            "concentration_mol_l",
+            "--output",
+        ]);
+
+        assert_eq!(
+            result,
+            Err(CliError::User("missing value for --output".to_string()))
+        );
     }
 
     #[test]
@@ -658,7 +779,12 @@ mod tests {
         assert!(output.stdout.contains("--time-column <column>"));
         assert!(output.stdout.contains("--concentration-column <column>"));
         assert!(output.stdout.contains("--json"));
+        assert!(output.stdout.contains("--output <path>"));
         assert!(output.stdout.contains("Text output is the default."));
+        assert!(output
+            .stdout
+            .contains("Existing targets are not overwritten"));
+        assert!(output.stdout.contains("parent directories are not created"));
         assert_eq!(output.stderr, "");
     }
 
