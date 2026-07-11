@@ -4,7 +4,17 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let output = deepseek_science_cli::run_cli(std::env::args());
+    let args = std::env::args_os()
+        .map(|argument| argument.into_string())
+        .collect::<Result<Vec<_>, _>>();
+    let output = match args {
+        Ok(args) => deepseek_science_cli::run_cli(args),
+        Err(_) => deepseek_science_cli::CliOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "error: CLI arguments must be valid UTF-8\n".to_string(),
+        },
+    };
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
 

@@ -266,6 +266,29 @@ already exist, and the output target must not exist because files are never
 overwritten. With `--json --output`, stdout and the saved file contain
 byte-identical JSON.
 
+### Deterministic kinetics SVG plot
+
+Plotting is a separate explicit command from `kinetics analyze`:
+
+```sh
+deepseek-science kinetics plot \
+  --input <path> \
+  --time-column <column> \
+  --concentration-column <column> \
+  --output <path.svg>
+```
+
+The command reads one regular simple numeric UTF-8 CSV limited to 16 MiB,
+uses the exact selected columns and existing deterministic kinetics analysis,
+and publishes one standalone deterministic SVG. The chart shows accepted
+observations together with the existing first-order and second-order fits; its
+MVP heuristic preference is not a confirmed reaction-order determination.
+
+The `.svg` target must be new and its parent directory must already exist.
+Existing targets are never overwritten, directories are not created, and no
+JSON sidecar or other persistent output is produced. `kinetics analyze` remains
+an independent text/JSON command and does not implicitly create a plot.
+
 Current limitations:
 
 - No DeepSeek or other model calls.
@@ -279,7 +302,6 @@ Current limitations:
 - No Excel or proprietary binary instrument formats.
 - No automatic chemistry interpretation or column selection.
 - No batch or recursive data import.
-- No plotting.
 - No JSON error schema.
 - No output overwrite support.
 - No artifact persistence.
@@ -294,7 +316,8 @@ while atomically publishing one JSON target. These commands create no parent
 directories, storage records, logs, caches, artifacts, run records, or project
 workspace state. Explicit `data convert --output` likewise uses atomic
 create-new publication for one target, never overwrites, and never creates its
-parent directory.
+parent directory. Explicit `kinetics plot --output` uses the same atomic
+create-new publication boundary for one SVG target and creates no JSON sidecar.
 
 ## Phase 1 Boundaries
 

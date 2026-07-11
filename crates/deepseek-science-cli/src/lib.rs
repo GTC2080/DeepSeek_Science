@@ -10,9 +10,9 @@ use std::path::{Component, Path, PathBuf};
 
 use deepseek_science_artifacts::hash_bytes;
 use deepseek_science_chemistry::{
-    KineticsAnalysisResult, KineticsColumns, KineticsComparisonBasis, KineticsError,
-    KineticsModelKind, KineticsReviewCheckKind, KineticsReviewSeverity, KineticsReviewStatus,
-    ValidatedKineticsInput,
+    render_kinetics_svg, KineticsAnalysisResult, KineticsColumns, KineticsComparisonBasis,
+    KineticsError, KineticsModelKind, KineticsPlotData, KineticsReviewCheckKind,
+    KineticsReviewSeverity, KineticsReviewStatus, ValidatedKineticsInput,
 };
 use deepseek_science_common::{
     assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, mean,
@@ -94,6 +94,14 @@ struct KineticsAnalyzeArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct KineticsPlotArgs {
+    input_path: String,
+    time_column: String,
+    concentration_column: String,
+    output_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DataInspectArgs {
     input_path: String,
 }
@@ -112,6 +120,8 @@ enum BoundedReadError {
 
 const MAX_DISPLAYED_HEADERS: usize = 32;
 const MAX_HEADER_DISPLAY_CHARS: usize = 120;
+const MAX_KINETICS_SVG_BYTES: usize = 4 * 1024 * 1024;
+const KINETICS_SVG_ROOT_LINE: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 960 640\" width=\"960\" height=\"640\" role=\"img\" aria-labelledby=\"plot-title plot-desc\" font-family=\"system-ui, sans-serif\">";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CliError {
@@ -145,6 +155,8 @@ fn usage() -> String {
 Usage: deepseek-science <doctor|version|help|kinetics|data>
 
 Commands:
+  kinetics analyze   Analyze one simple numeric kinetics CSV
+  kinetics plot      Publish one deterministic kinetics SVG
   data inspect   Inspect one laboratory text file without modifying it
   data convert   Normalize one eligible laboratory text table into a new CSV
 "
@@ -201,7 +213,13 @@ Limits and behavior:
 }
 
 fn kinetics_usage() -> &'static str {
-    "Usage: deepseek-science kinetics <analyze>\n"
+    "\
+Usage: deepseek-science kinetics <analyze|plot>
+
+Commands:
+  analyze   Analyze one simple numeric kinetics CSV
+  plot      Publish one deterministic kinetics SVG
+"
 }
 
 fn kinetics_analyze_usage() -> &'static str {
@@ -222,6 +240,31 @@ Notes:
   --output explicitly saves JSON after successful analysis.
   Existing targets are not overwritten, and parent directories are not created.
   Errors are written to stderr.
+"
+}
+
+fn kinetics_plot_usage() -> &'static str {
+    "\
+Usage:
+  deepseek-science kinetics plot \\
+    --input <path> \\
+    --time-column <column> \\
+    --concentration-column <column> \\
+    --output <path.svg>
+
+Options:
+  --input <path>                    Path to one regular simple numeric UTF-8 CSV file
+  --time-column <column>            Exact time column name
+  --concentration-column <column>   Exact concentration column name
+  --output <path.svg>               New standalone deterministic SVG target
+  -h, --help                        Show this help
+
+Limits and behavior:
+  Input is limited to 16 MiB.
+  The output extension must be .svg (ASCII case-insensitive).
+  The output parent must already exist; parent directories are not created.
+  Existing targets are not overwritten.
+  The command publishes no JSON sidecar or other persistent output.
 "
 }
 
@@ -382,11 +425,36 @@ where
 {
     match args.next().as_deref() {
         Some("analyze") => run_kinetics_analyze(args),
+        Some("plot") => run_kinetics_plot(args),
         Some(command) => CliOutput::user_error_with_usage(
             format!("unknown kinetics subcommand: {command}"),
             kinetics_usage(),
         ),
         None => CliOutput::user_error_with_usage("missing kinetics subcommand", kinetics_usage()),
+    }
+}
+
+fn run_kinetics_plot<I>(args: I) -> CliOutput
+where
+    I: IntoIterator<Item = String>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
+        return CliOutput::success(kinetics_plot_usage().to_string());
+    }
+
+    let args = match parse_kinetics_plot_args(args) {
+        Ok(args) => args,
+        Err(CliError::User(message)) => {
+            return CliOutput::user_error_with_usage(message, kinetics_plot_usage());
+        }
+        Err(CliError::Internal(message)) => return CliOutput::internal_error(message),
+    };
+
+    match plot_kinetics_csv(&args) {
+        Ok(output) => CliOutput::success(output),
+        Err(CliError::User(message)) => CliOutput::user_error(message),
+        Err(CliError::Internal(message)) => CliOutput::internal_error(message),
     }
 }
 
@@ -471,6 +539,58 @@ where
         })?,
         json_output,
         output_path,
+    })
+}
+
+fn parse_kinetics_plot_args<I>(args: I) -> Result<KineticsPlotArgs, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut input_path = None;
+    let mut time_column = None;
+    let mut concentration_column = None;
+    let mut output_path = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--input" => {
+                let value = next_data_option_value(&mut args, "--input")?;
+                set_required_arg(&mut input_path, "--input", value)?;
+            }
+            "--time-column" => {
+                let value = next_data_option_value(&mut args, "--time-column")?;
+                set_required_arg(&mut time_column, "--time-column", value)?;
+            }
+            "--concentration-column" => {
+                let value = next_data_option_value(&mut args, "--concentration-column")?;
+                set_required_arg(&mut concentration_column, "--concentration-column", value)?;
+            }
+            "--output" => {
+                let value = next_data_option_value(&mut args, "--output")?;
+                set_required_arg(&mut output_path, "--output", value)?;
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::User(format!("unknown argument {value}")));
+            }
+            value => {
+                return Err(CliError::User(format!(
+                    "unexpected positional argument {value}"
+                )));
+            }
+        }
+    }
+
+    Ok(KineticsPlotArgs {
+        input_path: input_path
+            .ok_or_else(|| CliError::User("missing required argument --input".to_string()))?,
+        time_column: time_column
+            .ok_or_else(|| CliError::User("missing required argument --time-column".to_string()))?,
+        concentration_column: concentration_column.ok_or_else(|| {
+            CliError::User("missing required argument --concentration-column".to_string())
+        })?,
+        output_path: output_path
+            .ok_or_else(|| CliError::User("missing required argument --output".to_string()))?,
     })
 }
 
@@ -1015,6 +1135,90 @@ fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> 
     }
 }
 
+fn plot_kinetics_csv(args: &KineticsPlotArgs) -> Result<String, CliError> {
+    if paths_are_lexically_equal(&args.input_path, &args.output_path) {
+        return Err(CliError::User(
+            "input and output paths must be different".to_string(),
+        ));
+    }
+    validate_svg_output_path(&args.output_path)?;
+
+    let bytes = read_inspection_input(&args.input_path)?;
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(CliError::User(
+            "kinetics plot input must be UTF-8 without a BOM".to_string(),
+        ));
+    }
+    let csv_text = std::str::from_utf8(&bytes).map_err(|error| {
+        CliError::User(format!(
+            "kinetics plot input is not valid UTF-8 at byte offset {}",
+            error.valid_up_to()
+        ))
+    })?;
+    let table = parse_simple_numeric_csv(csv_text)
+        .map_err(|error| CliError::User(format!("invalid CSV: {error}")))?;
+    let columns = KineticsColumns::new(&args.time_column, &args.concentration_column)
+        .map_err(format_kinetics_error)?;
+    let input =
+        ValidatedKineticsInput::from_table(&table, &columns).map_err(format_kinetics_error)?;
+    let analysis = KineticsAnalysisResult::analyze(&input).map_err(format_kinetics_error)?;
+    let plot_data = KineticsPlotData::from_analysis(&input, &columns, &analysis)
+        .map_err(|error| CliError::User(format!("kinetics plot data failed: {error}")))?;
+    let svg = render_kinetics_svg(&plot_data)
+        .map_err(|error| CliError::User(format!("kinetics SVG rendering failed: {error}")))?;
+
+    validate_kinetics_svg_boundary(&svg)?;
+    write_svg_output_file(&args.output_path, svg.as_bytes())?;
+    Ok("kinetics plot complete\n".to_string())
+}
+
+fn validate_svg_output_path(output_path: &str) -> Result<(), CliError> {
+    let path = Path::new(output_path);
+    if path.as_os_str().is_empty()
+        || output_path.ends_with('/')
+        || output_path.ends_with('\\')
+        || path.file_name().is_none()
+    {
+        return Err(CliError::User(
+            "kinetics plot output must include a file name".to_string(),
+        ));
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            CliError::User(
+                "kinetics plot output must have a valid UTF-8 .svg extension".to_string(),
+            )
+        })?;
+    if !extension.eq_ignore_ascii_case("svg") {
+        return Err(CliError::User(
+            "kinetics plot output must have a .svg extension".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_kinetics_svg_boundary(svg: &str) -> Result<(), CliError> {
+    validate_kinetics_svg_boundary_with_limit(svg, MAX_KINETICS_SVG_BYTES)
+}
+
+fn validate_kinetics_svg_boundary_with_limit(svg: &str, maximum: usize) -> Result<(), CliError> {
+    let valid = svg.len() <= maximum
+        && !svg.as_bytes().starts_with(&[0xef, 0xbb, 0xbf])
+        && !svg.contains('\r')
+        && svg.lines().next() == Some(KINETICS_SVG_ROOT_LINE)
+        && svg.ends_with("</svg>\n")
+        && !svg.ends_with("\n\n");
+    if !valid {
+        return Err(CliError::Internal(
+            "kinetics SVG renderer violated the CLI publication contract".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn write_json_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError> {
     let plan = plan_output_file(output_path)?;
     plan.execute(bytes).map_err(|error| {
@@ -1028,6 +1232,12 @@ fn write_converted_output_file(output_path: &str, bytes: &[u8]) -> Result<(), Cl
     let plan = plan_output_file(output_path)?;
     plan.execute(bytes)
         .map_err(|error| format_conversion_publication_error(output_path, error))
+}
+
+fn write_svg_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let plan = plan_output_file(output_path)?;
+    plan.execute(bytes)
+        .map_err(|error| format_plot_publication_error(output_path, error))
 }
 
 fn plan_output_file(output_path: &str) -> Result<AtomicWritePlan, CliError> {
@@ -1072,6 +1282,20 @@ fn format_conversion_publication_error(output_path: &str, error: StorageError) -
         )),
         _ => CliError::User(format!(
             "conversion publication failed for `{output_path}`; the requested target may exist, inspect it before retrying"
+        )),
+    }
+}
+
+fn format_plot_publication_error(output_path: &str, error: StorageError) -> CliError {
+    match error {
+        StorageError::TargetAlreadyExists { .. } => {
+            CliError::User(format!("kinetics plot output target `{output_path}` already exists"))
+        }
+        StorageError::ParentDirectoryMissing { .. } => CliError::User(format!(
+            "kinetics plot output parent directory does not exist or is not a directory for `{output_path}`"
+        )),
+        _ => CliError::User(format!(
+            "kinetics plot publication failed for `{output_path}`; the requested target may exist, inspect it before retrying"
         )),
     }
 }
@@ -1312,14 +1536,20 @@ mod tests {
 
     use super::{
         format_conversion_publication_error, format_data_conversion_report,
-        format_data_inspection_report, format_kinetics_analysis_output, parse_data_convert_args,
-        parse_data_inspect_args, parse_kinetics_analyze_args, paths_are_lexically_equal,
-        read_bounded, run_cli, BoundedReadError, CliError, DataConvertArgs, DataInspectArgs,
-        KineticsAnalyzeArgs,
+        format_data_inspection_report, format_kinetics_analysis_output,
+        format_plot_publication_error, parse_data_convert_args, parse_data_inspect_args,
+        parse_kinetics_analyze_args, parse_kinetics_plot_args, paths_are_lexically_equal,
+        read_bounded, run_cli, validate_kinetics_svg_boundary_with_limit, BoundedReadError,
+        CliError, DataConvertArgs, DataInspectArgs, KineticsAnalyzeArgs, KineticsPlotArgs,
+        KINETICS_SVG_ROOT_LINE,
     };
 
     fn parse_args(args: &[&str]) -> Result<KineticsAnalyzeArgs, CliError> {
         parse_kinetics_analyze_args(args.iter().map(|value| (*value).to_string()))
+    }
+
+    fn parse_plot_args(args: &[&str]) -> Result<KineticsPlotArgs, CliError> {
+        parse_kinetics_plot_args(args.iter().map(|value| (*value).to_string()))
     }
 
     fn parse_data_args(args: &[&str]) -> Result<DataInspectArgs, CliError> {
@@ -1570,6 +1800,100 @@ mod tests {
             )
         );
         assert!(!format!("{error:?}").contains("secret.atomic-write.tmp"));
+    }
+
+    #[test]
+    fn plot_arg_parser_accepts_only_the_four_required_values() {
+        assert_eq!(
+            parse_plot_args(&[
+                "--input",
+                "input.csv",
+                "--time-column",
+                "time",
+                "--concentration-column",
+                "concentration",
+                "--output",
+                "output.svg",
+            ]),
+            Ok(KineticsPlotArgs {
+                input_path: "input.csv".to_string(),
+                time_column: "time".to_string(),
+                concentration_column: "concentration".to_string(),
+                output_path: "output.svg".to_string(),
+            })
+        );
+        for unsupported in ["--json", "--force", "--overwrite", "--format"] {
+            assert_eq!(
+                parse_plot_args(&[unsupported]),
+                Err(CliError::User(format!("unknown argument {unsupported}")))
+            );
+        }
+    }
+
+    #[test]
+    fn plot_svg_boundary_validation_rejects_each_invalid_byte_contract() {
+        let valid = format!("{KINETICS_SVG_ROOT_LINE}\n</svg>\n");
+        assert_eq!(
+            validate_kinetics_svg_boundary_with_limit(&valid, valid.len()),
+            Ok(())
+        );
+
+        for invalid in [
+            format!("\u{feff}{valid}"),
+            valid.replace('\n', "\r\n"),
+            valid.trim_end_matches('\n').to_string(),
+            format!("{valid}\n"),
+            "<svg>\n</svg>\n".to_string(),
+        ] {
+            assert!(matches!(
+                validate_kinetics_svg_boundary_with_limit(&invalid, invalid.len()),
+                Err(CliError::Internal(_))
+            ));
+        }
+        assert!(matches!(
+            validate_kinetics_svg_boundary_with_limit(&valid, valid.len() - 1),
+            Err(CliError::Internal(_))
+        ));
+    }
+
+    #[test]
+    fn plot_publication_errors_are_stable_and_hide_storage_paths() {
+        assert_eq!(
+            format_plot_publication_error(
+                "result.svg",
+                StorageError::TargetAlreadyExists {
+                    path: PathBuf::from("internal/result.svg"),
+                },
+            ),
+            CliError::User("kinetics plot output target `result.svg` already exists".to_string())
+        );
+        assert_eq!(
+            format_plot_publication_error(
+                "missing/result.svg",
+                StorageError::ParentDirectoryMissing {
+                    path: PathBuf::from("internal/missing/result.svg"),
+                },
+            ),
+            CliError::User(
+                "kinetics plot output parent directory does not exist or is not a directory for `missing/result.svg`"
+                    .to_string()
+            )
+        );
+        let uncertain = format_plot_publication_error(
+            "result.svg",
+            StorageError::WriteFailed {
+                path: PathBuf::from("secret.atomic-write.tmp"),
+                reason: "denied".to_string(),
+            },
+        );
+        assert_eq!(
+            uncertain,
+            CliError::User(
+                "kinetics plot publication failed for `result.svg`; the requested target may exist, inspect it before retrying"
+                    .to_string()
+            )
+        );
+        assert!(!format!("{uncertain:?}").contains("secret.atomic-write.tmp"));
     }
 
     #[test]
