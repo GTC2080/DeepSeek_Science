@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod kinetics;
+pub mod kinetics_plot;
 
 pub use error::KineticsError;
 pub use kinetics::{
@@ -19,4 +20,8 @@ pub use kinetics::{
     KineticsPoint, KineticsReview, KineticsReviewCheckKind, KineticsReviewFinding,
     KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRow, RejectedKineticsRowReason,
     ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+};
+pub use kinetics_plot::{
+    KineticsCurveSegment, KineticsPlotData, KineticsPlotDataError, KineticsPlotModelData,
+    KineticsPredictionPoint, KineticsVisualizationWarning,
 };
