@@ -12,6 +12,7 @@
 pub mod error;
 pub mod kinetics;
 pub mod kinetics_plot;
+pub mod kinetics_svg;
 
 pub use error::KineticsError;
 pub use kinetics::{
@@ -25,3 +26,4 @@ pub use kinetics_plot::{
     KineticsCurveSegment, KineticsPlotData, KineticsPlotDataError, KineticsPlotModelData,
     KineticsPredictionPoint, KineticsVisualizationWarning,
 };
+pub use kinetics_svg::{render_kinetics_svg, KineticsSvgRenderError};
