@@ -22,3 +22,54 @@ pub enum ArtifactKind {
     /// Artifact kind is not known yet.
     Unknown,
 }
+
+impl ArtifactKind {
+    /// Returns the stable lowercase label used by artifact envelopes.
+    ///
+    /// This accessor does not change the enum's existing serde representation.
+    pub fn machine_label(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Figure => "figure",
+            Self::Report => "report",
+            Self::Code => "code",
+            Self::Json => "json",
+            Self::Text => "text",
+            Self::Log => "log",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ArtifactKind;
+
+    #[test]
+    fn every_kind_has_a_stable_machine_label() {
+        let cases = [
+            (ArtifactKind::Table, "table"),
+            (ArtifactKind::Figure, "figure"),
+            (ArtifactKind::Report, "report"),
+            (ArtifactKind::Code, "code"),
+            (ArtifactKind::Json, "json"),
+            (ArtifactKind::Text, "text"),
+            (ArtifactKind::Log, "log"),
+            (ArtifactKind::Unknown, "unknown"),
+        ];
+
+        for (kind, expected) in cases {
+            assert_eq!(kind.machine_label(), expected);
+        }
+    }
+
+    #[test]
+    fn existing_serde_representation_is_unchanged() {
+        let serialized = serde_json::to_string(&ArtifactKind::Json).expect("kind should serialize");
+        let deserialized: ArtifactKind =
+            serde_json::from_str(&serialized).expect("kind should deserialize");
+
+        assert_eq!(serialized, "\"Json\"");
+        assert_eq!(deserialized, ArtifactKind::Json);
+    }
+}
