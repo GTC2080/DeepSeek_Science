@@ -266,6 +266,31 @@ already exist, and the output target must not exist because files are never
 overwritten. With `--json --output`, stdout and the saved file contain
 byte-identical JSON.
 
+### Deterministic kinetics artifact envelope
+
+Artifact publication is a separate explicit command:
+
+```sh
+deepseek-science kinetics artifact \
+  --input <path> \
+  --time-column <column> \
+  --concentration-column <column> \
+  --output <path.json>
+```
+
+The command reads one regular simple numeric CSV limited to 16 MiB. Input must
+be strict UTF-8 without a BOM, and the caller must provide the exact time and
+concentration column names. The embedded payload is the existing complete
+`kinetics.analysis.v1` JSON text, including its final LF. The outer schema is
+`kinetics.artifact.v1`; BLAKE3 descriptors bind both the raw input bytes and
+the exact payload bytes.
+
+The resulting envelope is deterministic and unregistered. It has no UUID,
+timestamp, run identity, or project identity. Its producer version comes from
+the current CLI package version. The command atomically publishes one new
+`.json` target, never overwrites, never creates its parent, and creates no
+payload or manifest sidecar. It performs no model call, network access, or RAG.
+
 ### Deterministic kinetics SVG plot
 
 Plotting is a separate explicit command from `kinetics analyze`:
@@ -304,8 +329,8 @@ Current limitations:
 - No batch or recursive data import.
 - No JSON error schema.
 - No output overwrite support.
-- No artifact persistence.
-- No storage records or project workspace storage.
+- No registered artifact repository, project workspace, run record, or
+  multi-file artifact persistence.
 - No UI.
 - No notebook, Jupyter, R, PubMed, or HPC integrations.
 
@@ -318,6 +343,9 @@ workspace state. Explicit `data convert --output` likewise uses atomic
 create-new publication for one target, never overwrites, and never creates its
 parent directory. Explicit `kinetics plot --output` uses the same atomic
 create-new publication boundary for one SVG target and creates no JSON sidecar.
+Explicit `kinetics artifact --output` publishes one unregistered JSON envelope
+through one create-new operation and creates no sidecar, directory, or storage
+record.
 
 ## Phase 1 Boundaries
 

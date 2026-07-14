@@ -8,11 +8,14 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
-use deepseek_science_artifacts::hash_bytes;
+use deepseek_science_artifacts::{hash_bytes, ArtifactError, UnregisteredArtifactEnvelope};
 use deepseek_science_chemistry::{
-    render_kinetics_svg, KineticsAnalysisResult, KineticsColumns, KineticsComparisonBasis,
-    KineticsError, KineticsModelKind, KineticsPlotData, KineticsReviewCheckKind,
-    KineticsReviewSeverity, KineticsReviewStatus, ValidatedKineticsInput,
+    prepare_kinetics_artifact_envelope, render_kinetics_svg, KineticsAnalysisResult,
+    KineticsColumns, KineticsComparisonBasis, KineticsError, KineticsModelKind, KineticsPlotData,
+    KineticsReviewCheckKind, KineticsReviewSeverity, KineticsReviewStatus, ValidatedKineticsInput,
+    CHEMISTRY_KINETICS_ARTIFACT_STEP, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+    KINETICS_ANALYSIS_PAYLOAD_SCHEMA_VERSION, KINETICS_ARTIFACT_ENVELOPE_SCHEMA_VERSION,
+    KINETICS_ARTIFACT_SOURCE_ROLE,
 };
 use deepseek_science_common::{
     assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, mean,
@@ -102,6 +105,14 @@ struct KineticsPlotArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct KineticsArtifactArgs {
+    input_path: String,
+    time_column: String,
+    concentration_column: String,
+    output_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DataInspectArgs {
     input_path: String,
 }
@@ -121,6 +132,9 @@ enum BoundedReadError {
 const MAX_DISPLAYED_HEADERS: usize = 32;
 const MAX_HEADER_DISPLAY_CHARS: usize = 120;
 const MAX_KINETICS_SVG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_KINETICS_ARTIFACT_INPUT_BYTES: usize = MAX_INSPECTION_BYTES;
+const MAX_KINETICS_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const KINETICS_ARTIFACT_PRODUCER_COMMAND: &str = "kinetics.artifact";
 const KINETICS_SVG_ROOT_LINE: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 960 640\" width=\"960\" height=\"640\" role=\"img\" aria-labelledby=\"plot-title plot-desc\" font-family=\"system-ui, sans-serif\">";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +171,7 @@ Usage: deepseek-science <doctor|version|help|kinetics|data>
 Commands:
   kinetics analyze   Analyze one simple numeric kinetics CSV
   kinetics plot      Publish one deterministic kinetics SVG
+  kinetics artifact  Publish one deterministic kinetics artifact envelope
   data inspect   Inspect one laboratory text file without modifying it
   data convert   Normalize one eligible laboratory text table into a new CSV
 "
@@ -214,11 +229,12 @@ Limits and behavior:
 
 fn kinetics_usage() -> &'static str {
     "\
-Usage: deepseek-science kinetics <analyze|plot>
+Usage: deepseek-science kinetics <analyze|plot|artifact>
 
 Commands:
   analyze   Analyze one simple numeric kinetics CSV
   plot      Publish one deterministic kinetics SVG
+  artifact   Publish one deterministic provenance-bearing JSON envelope
 "
 }
 
@@ -265,6 +281,32 @@ Limits and behavior:
   The output parent must already exist; parent directories are not created.
   Existing targets are not overwritten.
   The command publishes no JSON sidecar or other persistent output.
+"
+}
+
+fn kinetics_artifact_usage() -> &'static str {
+    "\
+Usage:
+  deepseek-science kinetics artifact \\
+    --input <path> \\
+    --time-column <column> \\
+    --concentration-column <column> \\
+    --output <path.json>
+
+Options:
+  --input <path>                    Path to one regular simple numeric UTF-8 CSV file
+  --time-column <column>            Exact time column name
+  --concentration-column <column>   Exact concentration column name
+  --output <path.json>              New deterministic JSON envelope target
+  -h, --help                        Show this help
+
+Limits and behavior:
+  Input is limited to 16 MiB and must be UTF-8 without a BOM.
+  The output extension must be .json (ASCII case-insensitive).
+  The output parent must already exist; parent directories are not created.
+  Existing targets are not overwritten.
+  The command publishes one single envelope and no payload sidecar, manifest sidecar, SVG, project, or run record.
+  Errors are written to stderr.
 "
 }
 
@@ -426,11 +468,36 @@ where
     match args.next().as_deref() {
         Some("analyze") => run_kinetics_analyze(args),
         Some("plot") => run_kinetics_plot(args),
+        Some("artifact") => run_kinetics_artifact(args),
         Some(command) => CliOutput::user_error_with_usage(
             format!("unknown kinetics subcommand: {command}"),
             kinetics_usage(),
         ),
         None => CliOutput::user_error_with_usage("missing kinetics subcommand", kinetics_usage()),
+    }
+}
+
+fn run_kinetics_artifact<I>(args: I) -> CliOutput
+where
+    I: IntoIterator<Item = String>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if matches!(args.as_slice(), [flag] if flag == "--help" || flag == "-h") {
+        return CliOutput::success(kinetics_artifact_usage().to_string());
+    }
+
+    let args = match parse_kinetics_artifact_args(args) {
+        Ok(args) => args,
+        Err(CliError::User(message)) => {
+            return CliOutput::user_error_with_usage(message, kinetics_artifact_usage());
+        }
+        Err(CliError::Internal(message)) => return CliOutput::internal_error(message),
+    };
+
+    match create_kinetics_artifact(&args) {
+        Ok(output) => CliOutput::success(output),
+        Err(CliError::User(message)) => CliOutput::user_error(message),
+        Err(CliError::Internal(message)) => CliOutput::internal_error(message),
     }
 }
 
@@ -539,6 +606,58 @@ where
         })?,
         json_output,
         output_path,
+    })
+}
+
+fn parse_kinetics_artifact_args<I>(args: I) -> Result<KineticsArtifactArgs, CliError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut input_path = None;
+    let mut time_column = None;
+    let mut concentration_column = None;
+    let mut output_path = None;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--input" => {
+                let value = next_data_option_value(&mut args, "--input")?;
+                set_required_arg(&mut input_path, "--input", value)?;
+            }
+            "--time-column" => {
+                let value = next_data_option_value(&mut args, "--time-column")?;
+                set_required_arg(&mut time_column, "--time-column", value)?;
+            }
+            "--concentration-column" => {
+                let value = next_data_option_value(&mut args, "--concentration-column")?;
+                set_required_arg(&mut concentration_column, "--concentration-column", value)?;
+            }
+            "--output" => {
+                let value = next_data_option_value(&mut args, "--output")?;
+                set_required_arg(&mut output_path, "--output", value)?;
+            }
+            value if value.starts_with('-') => {
+                return Err(CliError::User(format!("unknown argument {value}")));
+            }
+            value => {
+                return Err(CliError::User(format!(
+                    "unexpected positional argument {value}"
+                )));
+            }
+        }
+    }
+
+    Ok(KineticsArtifactArgs {
+        input_path: input_path
+            .ok_or_else(|| CliError::User("missing required argument --input".to_string()))?,
+        time_column: time_column
+            .ok_or_else(|| CliError::User("missing required argument --time-column".to_string()))?,
+        concentration_column: concentration_column.ok_or_else(|| {
+            CliError::User("missing required argument --concentration-column".to_string())
+        })?,
+        output_path: output_path
+            .ok_or_else(|| CliError::User("missing required argument --output".to_string()))?,
     })
 }
 
@@ -711,6 +830,83 @@ fn read_inspection_input(input_path: &str) -> Result<Vec<u8>, CliError> {
     };
 
     Ok(bytes)
+}
+
+fn read_kinetics_artifact_input(input_path: &str) -> Result<Vec<u8>, CliError> {
+    let file = fs::File::open(input_path).map_err(|error| {
+        CliError::User(format!(
+            "could not open input file `{input_path}` for kinetics artifact: {error}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        CliError::User(format!(
+            "could not inspect kinetics artifact input file `{input_path}`: {error}"
+        ))
+    })?;
+    validate_kinetics_artifact_input_metadata(
+        input_path,
+        metadata.is_file(),
+        metadata.len(),
+        MAX_KINETICS_ARTIFACT_INPUT_BYTES,
+    )?;
+
+    read_kinetics_artifact_bounded(file, input_path, MAX_KINETICS_ARTIFACT_INPUT_BYTES)
+}
+
+fn validate_kinetics_artifact_input_metadata(
+    input_path: &str,
+    is_regular_file: bool,
+    actual_bytes: u64,
+    maximum: usize,
+) -> Result<(), CliError> {
+    if !is_regular_file {
+        return Err(CliError::User(format!(
+            "kinetics artifact input path `{input_path}` must refer to a regular file"
+        )));
+    }
+    let maximum = u64::try_from(maximum).map_err(|_| {
+        CliError::Internal("kinetics artifact input limit exceeds the supported range".to_string())
+    })?;
+    if actual_bytes > maximum {
+        return Err(kinetics_artifact_input_limit_error(input_path));
+    }
+    Ok(())
+}
+
+fn read_kinetics_artifact_bounded<R: Read>(
+    reader: R,
+    input_path: &str,
+    maximum: usize,
+) -> Result<Vec<u8>, CliError> {
+    match read_bounded(reader, maximum) {
+        Ok(bytes) => Ok(bytes),
+        Err(BoundedReadError::LimitExceeded) => {
+            Err(kinetics_artifact_input_limit_error(input_path))
+        }
+        Err(BoundedReadError::Io(error)) => Err(CliError::User(format!(
+            "could not read kinetics artifact input file `{input_path}`: {error}"
+        ))),
+    }
+}
+
+fn kinetics_artifact_input_limit_error(input_path: &str) -> CliError {
+    CliError::User(format!(
+        "kinetics artifact input file `{input_path}` exceeds the fixed 16 MiB limit"
+    ))
+}
+
+fn decode_kinetics_artifact_input(bytes: &[u8]) -> Result<&str, CliError> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(CliError::User(
+            "kinetics artifact input must be UTF-8 without a BOM".to_string(),
+        ));
+    }
+    std::str::from_utf8(bytes).map_err(|error| {
+        CliError::User(format!(
+            "kinetics artifact input is not valid UTF-8 at byte offset {}",
+            error.valid_up_to()
+        ))
+    })
 }
 
 fn read_bounded<R: Read>(reader: R, maximum: usize) -> Result<Vec<u8>, BoundedReadError> {
@@ -1135,6 +1331,233 @@ fn analyze_kinetics_csv(args: &KineticsAnalyzeArgs) -> Result<String, CliError> 
     }
 }
 
+fn create_kinetics_artifact(args: &KineticsArtifactArgs) -> Result<String, CliError> {
+    if paths_are_lexically_equal(&args.input_path, &args.output_path) {
+        return Err(CliError::User(
+            "input and output paths must be different".to_string(),
+        ));
+    }
+    validate_kinetics_artifact_output_path(&args.output_path)?;
+
+    let raw_source_bytes = read_kinetics_artifact_input(&args.input_path)?;
+    let csv_text = decode_kinetics_artifact_input(&raw_source_bytes)?;
+    let table = parse_simple_numeric_csv(csv_text)
+        .map_err(|error| CliError::User(format!("invalid CSV: {error}")))?;
+    let columns = KineticsColumns::new(&args.time_column, &args.concentration_column)
+        .map_err(format_kinetics_error)?;
+    let input =
+        ValidatedKineticsInput::from_table(&table, &columns).map_err(format_kinetics_error)?;
+    let analysis = KineticsAnalysisResult::analyze(&input).map_err(format_kinetics_error)?;
+    let payload_utf8 = format_kinetics_analysis_json_output(
+        &args.input_path,
+        &args.time_column,
+        &args.concentration_column,
+        &analysis,
+    )?;
+    let envelope = prepare_kinetics_artifact_envelope(
+        &analysis,
+        &raw_source_bytes,
+        &payload_utf8,
+        KINETICS_ARTIFACT_PRODUCER_COMMAND,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|error| {
+        CliError::Internal(format!("kinetics artifact preparation failed: {error}"))
+    })?;
+    let envelope_bytes =
+        serialize_kinetics_artifact_envelope_with_limit(&envelope, MAX_KINETICS_ARTIFACT_BYTES)?;
+
+    validate_kinetics_artifact_boundary(&envelope_bytes, &envelope, &raw_source_bytes, &analysis)?;
+    write_kinetics_artifact_output_file(&args.output_path, &envelope_bytes)?;
+    Ok("kinetics artifact complete\n".to_string())
+}
+
+fn validate_kinetics_artifact_output_path(output_path: &str) -> Result<(), CliError> {
+    let path = Path::new(output_path);
+    if path.as_os_str().is_empty()
+        || output_path.ends_with('/')
+        || output_path.ends_with('\\')
+        || path.file_name().is_none()
+    {
+        return Err(CliError::User(
+            "kinetics artifact output must include a file name".to_string(),
+        ));
+    }
+
+    let extension = path.extension().ok_or_else(|| {
+        CliError::User("kinetics artifact output must have a .json extension".to_string())
+    })?;
+    let extension = extension.to_str().ok_or_else(|| {
+        CliError::User(
+            "kinetics artifact output must have a valid UTF-8 .json extension".to_string(),
+        )
+    })?;
+    if !extension.eq_ignore_ascii_case("json") {
+        return Err(CliError::User(
+            "kinetics artifact output must have a .json extension".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn serialize_kinetics_artifact_envelope_with_limit(
+    envelope: &UnregisteredArtifactEnvelope,
+    maximum: usize,
+) -> Result<Vec<u8>, CliError> {
+    envelope
+        .to_pretty_json_bytes_with_limit(maximum)
+        .map_err(|error| match error {
+            ArtifactError::SerializedEnvelopeTooLarge { .. } => CliError::User(
+                "kinetics artifact envelope exceeds the fixed 4 MiB output limit".to_string(),
+            ),
+            _ => CliError::Internal(format!(
+                "kinetics artifact envelope serialization failed: {error}"
+            )),
+        })
+}
+
+fn validate_kinetics_artifact_boundary(
+    bytes: &[u8],
+    envelope: &UnregisteredArtifactEnvelope,
+    raw_source_bytes: &[u8],
+    analysis: &KineticsAnalysisResult,
+) -> Result<(), CliError> {
+    let invalid = || {
+        CliError::Internal(
+            "kinetics artifact envelope violated the CLI publication contract".to_string(),
+        )
+    };
+    if bytes.len() > MAX_KINETICS_ARTIFACT_BYTES
+        || bytes.starts_with(&[0xef, 0xbb, 0xbf])
+        || bytes.contains(&b'\r')
+    {
+        return Err(invalid());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    if !text.ends_with("}\n")
+        || text.ends_with("\n\n")
+        || text.lines().any(|line| line.ends_with(' '))
+    {
+        return Err(invalid());
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let top = value.as_object().ok_or_else(&invalid)?;
+    if top.len() != 3
+        || !top.contains_key("schema_version")
+        || !top.contains_key("artifact")
+        || !top.contains_key("payload_utf8")
+        || value["schema_version"] != KINETICS_ARTIFACT_ENVELOPE_SCHEMA_VERSION
+    {
+        return Err(invalid());
+    }
+
+    let payload_utf8 = value["payload_utf8"].as_str().ok_or_else(&invalid)?;
+    let artifact = value["artifact"].as_object().ok_or_else(&invalid)?;
+    let content = artifact
+        .get("content")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(&invalid)?;
+    let inputs = artifact
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(&invalid)?;
+    let input = inputs
+        .first()
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(&invalid)?;
+    let content_hash = content
+        .get("hash")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(&invalid)?;
+    let input_hash = input
+        .get("hash")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(&invalid)?;
+    let provenance = artifact
+        .get("provenance")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(&invalid)?;
+    let review = artifact
+        .get("review")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(&invalid)?;
+    let payload_length = u64::try_from(payload_utf8.len()).map_err(|_| invalid())?;
+    let input_length = u64::try_from(raw_source_bytes.len()).map_err(|_| invalid())?;
+    let finding_count = u64::try_from(analysis.review.findings.len()).map_err(|_| invalid())?;
+    let expected_review_status = review_status_label(analysis.review_status());
+
+    let valid = artifact.len() == 6
+        && artifact.get("kind").and_then(serde_json::Value::as_str) == Some("json")
+        && artifact.get("title").and_then(serde_json::Value::as_str)
+            == Some("Chemistry kinetics analysis result")
+        && content.len() == 5
+        && content
+            .get("media_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("application/json")
+        && content
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            == Some(KINETICS_ANALYSIS_PAYLOAD_SCHEMA_VERSION)
+        && content.get("encoding").and_then(serde_json::Value::as_str) == Some("utf-8")
+        && content
+            .get("byte_length")
+            .and_then(serde_json::Value::as_u64)
+            == Some(payload_length)
+        && content_hash.len() == 2
+        && content_hash
+            .get("algorithm")
+            .and_then(serde_json::Value::as_str)
+            == Some("blake3")
+        && content_hash
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            == Some(hash_bytes(payload_utf8.as_bytes()).as_str())
+        && inputs.len() == 1
+        && input.len() == 3
+        && input.get("role").and_then(serde_json::Value::as_str)
+            == Some(KINETICS_ARTIFACT_SOURCE_ROLE)
+        && input.get("byte_length").and_then(serde_json::Value::as_u64) == Some(input_length)
+        && input_hash.len() == 2
+        && input_hash
+            .get("algorithm")
+            .and_then(serde_json::Value::as_str)
+            == Some("blake3")
+        && input_hash.get("value").and_then(serde_json::Value::as_str)
+            == Some(hash_bytes(raw_source_bytes).as_str())
+        && provenance.len() == 4
+        && provenance
+            .get("workflow_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(CHEMISTRY_KINETICS_CSV_WORKFLOW_ID)
+        && provenance
+            .get("workflow_step")
+            .and_then(serde_json::Value::as_str)
+            == Some(CHEMISTRY_KINETICS_ARTIFACT_STEP)
+        && provenance
+            .get("producer_command")
+            .and_then(serde_json::Value::as_str)
+            == Some(KINETICS_ARTIFACT_PRODUCER_COMMAND)
+        && provenance
+            .get("producer_version")
+            .and_then(serde_json::Value::as_str)
+            == Some(env!("CARGO_PKG_VERSION"))
+        && review.len() == 2
+        && review.get("status").and_then(serde_json::Value::as_str) == Some(expected_review_status)
+        && review.get("status").and_then(serde_json::Value::as_str)
+            == Some(envelope.artifact().review().status().machine_label())
+        && review
+            .get("finding_count")
+            .and_then(serde_json::Value::as_u64)
+            == Some(finding_count)
+        && payload_utf8 == envelope.payload_utf8();
+    if !valid {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn plot_kinetics_csv(args: &KineticsPlotArgs) -> Result<String, CliError> {
     if paths_are_lexically_equal(&args.input_path, &args.output_path) {
         return Err(CliError::User(
@@ -1240,6 +1663,12 @@ fn write_svg_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError
         .map_err(|error| format_plot_publication_error(output_path, error))
 }
 
+fn write_kinetics_artifact_output_file(output_path: &str, bytes: &[u8]) -> Result<(), CliError> {
+    let plan = plan_output_file(output_path)?;
+    plan.execute(bytes)
+        .map_err(|error| format_artifact_publication_error(output_path, error))
+}
+
 fn plan_output_file(output_path: &str) -> Result<AtomicWritePlan, CliError> {
     let path = Path::new(output_path);
     if path.as_os_str().is_empty() {
@@ -1296,6 +1725,20 @@ fn format_plot_publication_error(output_path: &str, error: StorageError) -> CliE
         )),
         _ => CliError::User(format!(
             "kinetics plot publication failed for `{output_path}`; the requested target may exist, inspect it before retrying"
+        )),
+    }
+}
+
+fn format_artifact_publication_error(output_path: &str, error: StorageError) -> CliError {
+    match error {
+        StorageError::TargetAlreadyExists { .. } => CliError::User(format!(
+            "kinetics artifact output target `{output_path}` already exists"
+        )),
+        StorageError::ParentDirectoryMissing { .. } => CliError::User(format!(
+            "kinetics artifact output parent directory does not exist or is not a directory for `{output_path}`"
+        )),
+        _ => CliError::User(format!(
+            "kinetics artifact publication failed for `{output_path}`; the requested target may exist, inspect it before retrying"
         )),
     }
 }
@@ -1525,23 +1968,31 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
 
+    use deepseek_science_artifacts::{ArtifactError, UnregisteredArtifactEnvelope};
     use deepseek_science_chemistry::{
-        KineticsAnalysisResult, KineticsColumns, ValidatedKineticsInput,
+        prepare_kinetics_artifact_envelope, KineticsAnalysisResult, KineticsColumns,
+        ValidatedKineticsInput,
     };
     use deepseek_science_common::{
-        assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding, DataColumn,
-        DataTable,
+        assess_simple_csv_compatibility, inspect_delimited_text, inspect_text_encoding,
+        parse_simple_numeric_csv, DataColumn, DataTable, MAX_INSPECTION_BYTES,
     };
     use deepseek_science_storage::StorageError;
 
     use super::{
+        decode_kinetics_artifact_input, format_artifact_publication_error,
         format_conversion_publication_error, format_data_conversion_report,
-        format_data_inspection_report, format_kinetics_analysis_output,
-        format_plot_publication_error, parse_data_convert_args, parse_data_inspect_args,
-        parse_kinetics_analyze_args, parse_kinetics_plot_args, paths_are_lexically_equal,
-        read_bounded, run_cli, validate_kinetics_svg_boundary_with_limit, BoundedReadError,
-        CliError, DataConvertArgs, DataInspectArgs, KineticsAnalyzeArgs, KineticsPlotArgs,
-        KINETICS_SVG_ROOT_LINE,
+        format_data_inspection_report, format_kinetics_analysis_json_output,
+        format_kinetics_analysis_output, format_plot_publication_error, kinetics_artifact_usage,
+        kinetics_usage, parse_data_convert_args, parse_data_inspect_args,
+        parse_kinetics_analyze_args, parse_kinetics_artifact_args, parse_kinetics_plot_args,
+        paths_are_lexically_equal, read_bounded, read_kinetics_artifact_bounded, run_cli,
+        serialize_kinetics_artifact_envelope_with_limit, validate_kinetics_artifact_boundary,
+        validate_kinetics_artifact_input_metadata, validate_kinetics_artifact_output_path,
+        validate_kinetics_svg_boundary_with_limit, BoundedReadError, CliError, DataConvertArgs,
+        DataInspectArgs, KineticsAnalyzeArgs, KineticsArtifactArgs, KineticsPlotArgs,
+        KINETICS_ARTIFACT_PRODUCER_COMMAND, KINETICS_SVG_ROOT_LINE, MAX_KINETICS_ARTIFACT_BYTES,
+        MAX_KINETICS_ARTIFACT_INPUT_BYTES,
     };
 
     fn parse_args(args: &[&str]) -> Result<KineticsAnalyzeArgs, CliError> {
@@ -1584,6 +2035,52 @@ mod tests {
             .expect("two positive rows should remain");
 
         KineticsAnalysisResult::analyze(&input).expect("test analysis should succeed")
+    }
+
+    fn parse_artifact_args(args: &[&str]) -> Result<KineticsArtifactArgs, CliError> {
+        parse_kinetics_artifact_args(args.iter().map(|value| (*value).to_string()))
+    }
+
+    fn artifact_contract() -> (
+        Vec<u8>,
+        KineticsAnalysisResult,
+        UnregisteredArtifactEnvelope,
+        Vec<u8>,
+    ) {
+        let raw_source = b"time_s,concentration_mol_l\n0,1\n1,0.8\n2,0.6\n".to_vec();
+        let csv_text = std::str::from_utf8(&raw_source).expect("test source should be UTF-8");
+        let table = parse_simple_numeric_csv(csv_text).expect("test source should parse");
+        let columns = KineticsColumns::new("time_s", "concentration_mol_l")
+            .expect("test columns should construct");
+        let input = ValidatedKineticsInput::from_table(&table, &columns)
+            .expect("test input should validate");
+        let analysis = KineticsAnalysisResult::analyze(&input).expect("analysis should succeed");
+        let payload = format_kinetics_analysis_json_output(
+            "input.csv",
+            "time_s",
+            "concentration_mol_l",
+            &analysis,
+        )
+        .expect("payload should serialize");
+        let envelope = prepare_kinetics_artifact_envelope(
+            &analysis,
+            &raw_source,
+            &payload,
+            KINETICS_ARTIFACT_PRODUCER_COMMAND,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("envelope should construct");
+        let bytes = envelope
+            .to_pretty_json_bytes_with_limit(MAX_KINETICS_ARTIFACT_BYTES)
+            .expect("envelope should serialize");
+
+        (raw_source, analysis, envelope, bytes)
+    }
+
+    fn replace_once(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let text = std::str::from_utf8(bytes).expect("test bytes should be UTF-8");
+        assert!(text.contains(from), "test replacement source should exist");
+        text.replacen(from, to, 1).into_bytes()
     }
 
     #[test]
@@ -2245,5 +2742,318 @@ mod tests {
         assert!(!output.contains("definitive"));
         assert!(!output.contains("true model"));
         assert!(!output.contains("proved first-order"));
+    }
+
+    #[test]
+    fn artifact_routing_and_help_are_frozen() {
+        assert!(super::usage().contains("kinetics artifact"));
+        assert!(kinetics_usage().contains("<analyze|plot|artifact>"));
+        assert!(kinetics_usage().contains("artifact"));
+
+        for flag in ["--help", "-h"] {
+            let output = run_cli(["deepseek-science", "kinetics", "artifact", flag]);
+            assert_eq!(output.exit_code, 0);
+            assert_eq!(output.stderr, "");
+            assert_eq!(output.stdout, kinetics_artifact_usage());
+        }
+        let mixed = run_cli([
+            "deepseek-science",
+            "kinetics",
+            "artifact",
+            "--help",
+            "--input",
+            "input.csv",
+        ]);
+        assert_ne!(mixed.exit_code, 0);
+        assert_eq!(mixed.stdout, "");
+        assert!(mixed.stderr.contains("unknown argument --help"));
+    }
+
+    #[test]
+    fn artifact_arg_parser_accepts_exactly_four_required_options() {
+        assert_eq!(
+            parse_artifact_args(&[
+                "--input",
+                "input.csv",
+                "--time-column",
+                "time",
+                "--concentration-column",
+                "concentration",
+                "--output",
+                "result.json",
+            ]),
+            Ok(KineticsArtifactArgs {
+                input_path: "input.csv".to_string(),
+                time_column: "time".to_string(),
+                concentration_column: "concentration".to_string(),
+                output_path: "result.json".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn artifact_arg_parser_rejects_each_duplicate_and_missing_option() {
+        let valid = [
+            "--input",
+            "input.csv",
+            "--time-column",
+            "time",
+            "--concentration-column",
+            "concentration",
+            "--output",
+            "result.json",
+        ];
+        for option in [
+            "--input",
+            "--time-column",
+            "--concentration-column",
+            "--output",
+        ] {
+            let index = valid.iter().position(|value| value == &option).unwrap();
+            let mut duplicate = valid.to_vec();
+            duplicate.extend([option, valid[index + 1]]);
+            assert_eq!(
+                parse_artifact_args(&duplicate),
+                Err(CliError::User(format!("duplicate argument {option}")))
+            );
+
+            let missing = valid
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| *position != index && *position != index + 1)
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                parse_artifact_args(&missing),
+                Err(CliError::User(format!(
+                    "missing required argument {option}"
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_arg_parser_rejects_missing_values_unknowns_and_positionals() {
+        for option in [
+            "--input",
+            "--time-column",
+            "--concentration-column",
+            "--output",
+        ] {
+            assert_eq!(
+                parse_artifact_args(&[option]),
+                Err(CliError::User(format!("missing value for {option}")))
+            );
+            assert_eq!(
+                parse_artifact_args(&[option, ""]),
+                Err(CliError::User(format!("missing value for {option}")))
+            );
+        }
+        for option in ["--json", "--overwrite", "--force", "--rag"] {
+            assert_eq!(
+                parse_artifact_args(&[option]),
+                Err(CliError::User(format!("unknown argument {option}")))
+            );
+        }
+        assert_eq!(
+            parse_artifact_args(&["input.csv"]),
+            Err(CliError::User(
+                "unexpected positional argument input.csv".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn artifact_output_path_validation_is_lexical_and_json_specific() {
+        for output in ["result.json", "result.JSON", "result.JsOn"] {
+            assert_eq!(validate_kinetics_artifact_output_path(output), Ok(()));
+        }
+        for output in ["result", "result.svg", "result.json.txt"] {
+            assert_eq!(
+                validate_kinetics_artifact_output_path(output),
+                Err(CliError::User(
+                    "kinetics artifact output must have a .json extension".to_string()
+                ))
+            );
+        }
+        for output in ["", "directory/", "directory\\"] {
+            assert_eq!(
+                validate_kinetics_artifact_output_path(output),
+                Err(CliError::User(
+                    "kinetics artifact output must include a file name".to_string()
+                ))
+            );
+        }
+        assert!(paths_are_lexically_equal("same.json", "same.json"));
+    }
+
+    #[test]
+    fn artifact_input_and_output_limits_are_frozen() {
+        assert_eq!(MAX_KINETICS_ARTIFACT_INPUT_BYTES, MAX_INSPECTION_BYTES);
+        assert_eq!(MAX_KINETICS_ARTIFACT_INPUT_BYTES, 16 * 1024 * 1024);
+        assert_eq!(MAX_KINETICS_ARTIFACT_BYTES, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn artifact_bounded_reader_and_metadata_checks_use_inclusive_limits() {
+        assert_eq!(
+            read_kinetics_artifact_bounded(Cursor::new(b"abcd"), "input.csv", 4)
+                .expect("exact limit should succeed"),
+            b"abcd"
+        );
+        assert_eq!(
+            read_kinetics_artifact_bounded(Cursor::new(b"abcde"), "input.csv", 4),
+            Err(CliError::User(
+                "kinetics artifact input file `input.csv` exceeds the fixed 16 MiB limit"
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            validate_kinetics_artifact_input_metadata("input.csv", true, 4, 4),
+            Ok(())
+        );
+        assert_eq!(
+            validate_kinetics_artifact_input_metadata("input.csv", true, 5, 4),
+            Err(CliError::User(
+                "kinetics artifact input file `input.csv` exceeds the fixed 16 MiB limit"
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            validate_kinetics_artifact_input_metadata("input.csv", false, 0, 4),
+            Err(CliError::User(
+                "kinetics artifact input path `input.csv` must refer to a regular file".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn artifact_utf8_decoder_rejects_bom_and_reports_invalid_offset() {
+        assert_eq!(decode_kinetics_artifact_input(b"abc\n"), Ok("abc\n"));
+        assert_eq!(
+            decode_kinetics_artifact_input(b"\xef\xbb\xbfabc\n"),
+            Err(CliError::User(
+                "kinetics artifact input must be UTF-8 without a BOM".to_string()
+            ))
+        );
+        assert_eq!(
+            decode_kinetics_artifact_input(b"a\xff"),
+            Err(CliError::User(
+                "kinetics artifact input is not valid UTF-8 at byte offset 1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn artifact_envelope_serialization_has_an_exact_limit_seam() {
+        let (raw_source, analysis, envelope, expected) = artifact_contract();
+        let exact = serialize_kinetics_artifact_envelope_with_limit(&envelope, expected.len())
+            .expect("exact limit should succeed");
+        assert_eq!(exact, expected);
+        assert_eq!(
+            serialize_kinetics_artifact_envelope_with_limit(&envelope, expected.len() - 1),
+            Err(CliError::User(
+                "kinetics artifact envelope exceeds the fixed 4 MiB output limit".to_string()
+            ))
+        );
+        assert_eq!(
+            validate_kinetics_artifact_boundary(&exact, &envelope, &raw_source, &analysis),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn artifact_postcondition_rejects_invalid_outer_byte_contracts() {
+        let (raw_source, analysis, envelope, bytes) = artifact_contract();
+        let mut bom = b"\xef\xbb\xbf".to_vec();
+        bom.extend_from_slice(&bytes);
+        let cr = replace_once(&bytes, "\n", "\r\n");
+        let missing_lf = bytes[..bytes.len() - 1].to_vec();
+        let mut double_lf = bytes.clone();
+        double_lf.push(b'\n');
+
+        for invalid in [bom, cr, missing_lf, double_lf] {
+            assert!(matches!(
+                validate_kinetics_artifact_boundary(&invalid, &envelope, &raw_source, &analysis,),
+                Err(CliError::Internal(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn artifact_postcondition_rejects_wrong_schema_hashes_and_producer_version() {
+        let (raw_source, analysis, envelope, bytes) = artifact_contract();
+        let payload_hash = envelope.artifact().content().hash().value();
+        let input_hash = envelope.artifact().inputs()[0].hash().value();
+        let invalid = [
+            replace_once(&bytes, "kinetics.artifact.v1", "kinetics.artifact.v0"),
+            replace_once(&bytes, payload_hash, &"0".repeat(64)),
+            replace_once(&bytes, input_hash, &"f".repeat(64)),
+            replace_once(&bytes, env!("CARGO_PKG_VERSION"), "wrong-version"),
+        ];
+
+        for invalid in invalid {
+            assert!(matches!(
+                validate_kinetics_artifact_boundary(&invalid, &envelope, &raw_source, &analysis,),
+                Err(CliError::Internal(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn artifact_publication_errors_are_stable_and_hide_storage_paths() {
+        assert_eq!(
+            format_artifact_publication_error(
+                "result.json",
+                StorageError::TargetAlreadyExists {
+                    path: PathBuf::from("internal/result.json"),
+                },
+            ),
+            CliError::User(
+                "kinetics artifact output target `result.json` already exists".to_string()
+            )
+        );
+        assert_eq!(
+            format_artifact_publication_error(
+                "missing/result.json",
+                StorageError::ParentDirectoryMissing {
+                    path: PathBuf::from("internal/missing/result.json"),
+                },
+            ),
+            CliError::User(
+                "kinetics artifact output parent directory does not exist or is not a directory for `missing/result.json`"
+                    .to_string()
+            )
+        );
+        let uncertain = format_artifact_publication_error(
+            "result.json",
+            StorageError::WriteFailed {
+                path: PathBuf::from("secret.atomic-write.tmp"),
+                reason: "denied".to_string(),
+            },
+        );
+        assert_eq!(
+            uncertain,
+            CliError::User(
+                "kinetics artifact publication failed for `result.json`; the requested target may exist, inspect it before retrying"
+                    .to_string()
+            )
+        );
+        assert!(!format!("{uncertain:?}").contains("secret.atomic-write.tmp"));
+    }
+
+    #[test]
+    fn artifact_serializer_maps_generic_size_overflow_without_partial_bytes() {
+        let (_, _, envelope, _) = artifact_contract();
+        assert_eq!(
+            envelope.to_pretty_json_bytes_with_limit(0),
+            Err(ArtifactError::SerializedEnvelopeTooLarge { maximum: 0 })
+        );
+        assert_eq!(
+            serialize_kinetics_artifact_envelope_with_limit(&envelope, 0),
+            Err(CliError::User(
+                "kinetics artifact envelope exceeds the fixed 4 MiB output limit".to_string()
+            ))
+        );
     }
 }
