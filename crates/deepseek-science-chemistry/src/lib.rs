@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod kinetics;
+pub mod kinetics_artifact;
 pub mod kinetics_plot;
 pub mod kinetics_svg;
 
@@ -20,7 +21,11 @@ pub use kinetics::{
     KineticsComparisonBasis, KineticsFitResult, KineticsModelComparison, KineticsModelKind,
     KineticsPoint, KineticsReview, KineticsReviewCheckKind, KineticsReviewFinding,
     KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRow, RejectedKineticsRowReason,
-    ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+    ValidatedKineticsInput, CHEMISTRY_KINETICS_ARTIFACT_STEP, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+};
+pub use kinetics_artifact::{
+    prepare_kinetics_artifact_envelope, KINETICS_ANALYSIS_PAYLOAD_SCHEMA_VERSION,
+    KINETICS_ARTIFACT_ENVELOPE_SCHEMA_VERSION, KINETICS_ARTIFACT_SOURCE_ROLE,
 };
 pub use kinetics_plot::{
     KineticsCurveSegment, KineticsPlotData, KineticsPlotDataError, KineticsPlotModelData,

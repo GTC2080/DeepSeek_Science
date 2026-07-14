@@ -1,5 +1,6 @@
 //! Error types for chemistry workflow contracts.
 
+use deepseek_science_artifacts::ArtifactError;
 use deepseek_science_common::CommonError;
 use deepseek_science_core::CoreError;
 use thiserror::Error;
@@ -88,6 +89,14 @@ pub enum KineticsError {
         /// Invalid proposal field.
         field: &'static str,
     },
+
+    /// The existing review finding count exceeded the artifact contract range.
+    #[error("kinetics artifact review finding count exceeds the supported range")]
+    ArtifactReviewFindingCountOverflow,
+
+    /// Error raised while constructing generic in-memory artifact metadata.
+    #[error(transparent)]
+    Artifact(#[from] ArtifactError),
 
     /// Error raised by shared in-memory table contracts.
     #[error(transparent)]

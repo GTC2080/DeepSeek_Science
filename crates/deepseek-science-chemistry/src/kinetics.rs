@@ -18,9 +18,12 @@ use crate::error::KineticsError;
 /// suffix names the expected future user-facing adapter, not file IO here.
 pub const CHEMISTRY_KINETICS_CSV_WORKFLOW_ID: &str = "chemistry.kinetics_csv";
 
+/// Workflow step that produces the deterministic kinetics analysis artifact.
+pub const CHEMISTRY_KINETICS_ARTIFACT_STEP: &str = "produce_analysis_result";
+
 const MINIMUM_VALID_POINTS: usize = 2;
 const REVIEW_TOLERANCE: f64 = 1.0e-12;
-const KINETICS_ARTIFACT_TITLE: &str = "Chemistry kinetics analysis result";
+pub(crate) const KINETICS_ARTIFACT_TITLE: &str = "Chemistry kinetics analysis result";
 const KINETICS_ARTIFACT_PROVENANCE_NOTE: &str =
     "workflow=chemistry.kinetics_csv;step=produce_analysis_result;source=DataTable";
 const KINETICS_ARTIFACT_CANONICAL_VERSION: &str = "deepseek-science.chemistry.kinetics.analysis.v1";
@@ -58,7 +61,7 @@ pub fn kinetics_csv_workflow_plan() -> Result<WorkflowPlan, KineticsError> {
             workflow_step("compare_models", WorkflowStepKind::Review, "Compare models")?,
             workflow_step("review_result", WorkflowStepKind::Review, "Review result")?,
             workflow_step(
-                "produce_analysis_result",
+                CHEMISTRY_KINETICS_ARTIFACT_STEP,
                 WorkflowStepKind::ProduceArtifact,
                 "Produce analysis result",
             )?,
@@ -763,7 +766,7 @@ fn optional_model_kind_label(value: Option<KineticsModelKind>) -> &'static str {
     value.map_or("none", model_kind_label)
 }
 
-fn artifact_review_status(status: KineticsReviewStatus) -> ReviewStatus {
+pub(crate) fn artifact_review_status(status: KineticsReviewStatus) -> ReviewStatus {
     match status {
         KineticsReviewStatus::Passed => ReviewStatus::Passed,
         KineticsReviewStatus::PassedWithWarnings => ReviewStatus::PassedWithWarnings,
@@ -906,7 +909,8 @@ mod tests {
         KineticsColumns, KineticsComparisonBasis, KineticsError, KineticsFitResult,
         KineticsModelComparison, KineticsModelKind, KineticsReview, KineticsReviewCheckKind,
         KineticsReviewSeverity, KineticsReviewStatus, RejectedKineticsRowReason,
-        ValidatedKineticsInput, CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
+        ValidatedKineticsInput, CHEMISTRY_KINETICS_ARTIFACT_STEP,
+        CHEMISTRY_KINETICS_CSV_WORKFLOW_ID,
     };
 
     fn numeric_column(name: &str, values: &[f64]) -> DataColumn {
@@ -963,7 +967,7 @@ mod tests {
             "fit_second_order",
             "compare_models",
             "review_result",
-            "produce_analysis_result",
+            CHEMISTRY_KINETICS_ARTIFACT_STEP,
             "complete",
         ]
     }
@@ -1850,7 +1854,7 @@ mod tests {
             "kinetics_csv_workflow_plan",
             "inspect_input",
             "validate_kinetics_input",
-            "produce_analysis_result",
+            CHEMISTRY_KINETICS_ARTIFACT_STEP,
         ];
 
         for name in names {
